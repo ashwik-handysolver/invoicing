@@ -1,0 +1,7 @@
+node_modules/
+invoice.db
+invoice.db-*
+*.db-shm
+*.db-wal
+server.log
+.claude/
