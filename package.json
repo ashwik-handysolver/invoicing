@@ -11,6 +11,8 @@
     "node": ">=22.5"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "@google/genai": "^2.30.0",
     "exceljs": "^4.4.0",
     "express": "^4.21.0",
     "qrcode-generator": "^2.0.4"

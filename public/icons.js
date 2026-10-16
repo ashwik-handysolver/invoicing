@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 // Small line-icon set (24x24, stroke based) so the UI doesn't lean on emoji.
 const ICON_PATHS = {
   chart: 'M4 20V11M10 20V4M16 20v-6M22 20H2',
@@ -38,6 +38,7 @@ const ICON_PATHS = {
   eye: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6',
   rupee: 'M6 3h12M6 8h12M6 13l8.5 8M6 13h3a4 4 0 0 0 0-8',
   more: 'M5 12h.01M12 12h.01M19 12h.01',
+  mic: 'M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8',
 };
-const ic = (name, size = 20) =>
-  `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${ICON_PATHS[name] || ''}"/></svg>`;
+const ic = (name, size = 20, weight = 1.8) =>
+  `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${weight}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${ICON_PATHS[name] || ''}"/></svg>`;

@@ -5,3 +5,5 @@ invoice.db-*
 *.db-wal
 server.log
 .claude/
+
+.env
