@@ -30,17 +30,28 @@ function toggleTheme() {
   $$('[data-theme-btn]').forEach((b) => (b.innerHTML = themeIcon()));
 }
 document.addEventListener('click', (e) => { if (e.target.closest('[data-theme-btn]')) toggleTheme(); });
+// Mic button (sidebar + mobile tab bar) opens the voice assistant
+document.addEventListener('click', (e) => { if (e.target.closest('[data-mic]')) openVoice(); });
 
 const S = { token: localStorage.getItem('token'), user: null, meta: null, badge: 0 };
-const can = (k) => S.user && (S.user.perms.includes('*') || S.user.perms.includes(k));
+// management.view belongs only to management accounts — an org admin's '*' doesn't include it
+const can = (k) => !!S.user && (k === 'management.view' ? !!S.user.isManagement : S.user.perms.includes('*') || S.user.perms.includes(k));
 
+const PUBLIC_API = ['/login', '/signup', '/join', '/join/lookup'];
 async function api(path, { method = 'GET', body, raw } = {}) {
-  const res = await fetch('/api' + path, {
-    method,
-    headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (res.status === 401 && path !== '/login') { signOut(); throw new Error('Session expired'); }
+  let res;
+  try {
+    res = await fetch('/api' + path, {
+      method,
+      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch { throw new Error("Can't reach the server. Check your connection and try again."); }
+  if (res.status === 401 && !PUBLIC_API.includes(path)) { signOut(); throw new Error('Your session expired. Please sign in again.'); }
+  if (res.status === 403 && S.user?.membership?.status === 'approved') {
+    const d = await res.clone().json().catch(() => ({}));
+    if (d.code === 'no_membership') { boot(); throw new Error(d.error); } // access was removed while signed in
+  }
   if (raw) { if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed'); return res; }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Something went wrong');
@@ -67,7 +78,22 @@ function modal(html, { onClose } = {}) {
   document.body.append(ov);
   return { el: ov.firstElementChild, close };
 }
-const confirmBox = (msg) => confirm(msg);
+// In-app confirmation dialog (replaces the browser's confirm()). Resolves true / false.
+function confirmBox(msg, { ok } = {}) {
+  const danger = /^(delete|reject|disable|cancel|remove)/i.test(msg);
+  const label = ok || (danger ? msg.split(/\s/)[0].replace(/^./, (c) => c.toUpperCase()) : 'Confirm');
+  return new Promise((resolve) => {
+    let answer = false;
+    const m = modal(`<div class="cfm"><span class="cfm-ic ${danger ? 'bad' : ''}">${ic(danger ? 'trash' : 'check', 22)}</span>
+      <p>${esc(msg)}</p><div class="actions"><button type="button" class="btn" data-no>${danger && /^cancel/i.test(msg) ? 'Keep it' : 'Cancel'}</button>
+      <button type="button" class="btn ${danger ? 'danger solid' : 'primary'}" data-yes>${esc(label)}</button></div></div>`, { onClose: () => { document.removeEventListener('keydown', key, true); resolve(answer); } });
+    const key = (e) => { if (e.key === 'Escape') { e.stopPropagation(); m.close(); } };
+    document.addEventListener('keydown', key, true);
+    $('[data-no]', m.el).onclick = () => m.close();
+    $('[data-yes]', m.el).onclick = () => { answer = true; m.close(); };
+    setTimeout(() => $('[data-yes]', m.el)?.focus(), 30);
+  });
+}
 
 /* ------------------------------------------------------------ pagination (client-side, remembered per list) */
 const PG = {}, PAGE_SIZES = [10, 25, 50, 100];
@@ -96,12 +122,13 @@ const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toas
 
 /* ------------------------------------------------------------ auth + shell */
 function signOut() {
-  localStorage.removeItem('token'); S.token = null; S.user = null;
+  localStorage.removeItem('token'); S.token = null; S.user = null; S.meta = null;
+  clearTimeout(pollTimer); sessionSet('onb', null);
   renderLogin();
 }
 const LOGO = '<svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1f4fd8"/><stop offset="1" stop-color="#6a5cff"/></linearGradient></defs><rect width="64" height="64" rx="15" fill="url(#lg)"/><path d="M20 13h17l9 9v29H20z" fill="#fff"/><path d="M37 13l9 9H37z" fill="#c8d6ff"/><rect x="25" y="30" width="16" height="3" rx="1.5" fill="#1f4fd8"/><rect x="25" y="37" width="16" height="3" rx="1.5" fill="#1f4fd8"/><rect x="25" y="44" width="9" height="3" rx="1.5" fill="#1f4fd8"/></svg>';
 
-function renderLogin() {
+function authShell(card) {
   $('#app').innerHTML = `<div class="auth">
     <section class="auth-art" aria-hidden="true">
       <div class="art-brand">${LOGO} Invoice Manager</div>
@@ -126,25 +153,31 @@ function renderLogin() {
     </section>
     <section class="auth-form">
       <button type="button" class="ibtn" data-theme-btn aria-label="Toggle theme" style="position:absolute;top:14px;right:14px">${themeIcon()}</button>
-      <form class="auth-card" id="lf">
+      ${card}
+    </section></div>`;
+  $$('[data-showpw]').forEach((b) => (b.onclick = () => { const p = b.previousElementSibling, show = p.type === 'password'; p.type = show ? 'text' : 'password'; b.textContent = show ? 'Hide' : 'Show'; }));
+  $$('[data-go]').forEach((a) => (a.onclick = (e) => { e.preventDefault(); ({ login: renderLogin, signup: renderSignup, create: renderCreateAccount, join: renderJoin })[a.dataset.go](); }));
+}
+const pwField = (id, label, ac, ph) => `<div class="field"><label for="${id}">${label}</label><div class="inwrap pwwrap">${ic('lock', 18)}<input id="${id}" type="password" autocomplete="${ac}" placeholder="${ph}" required><button type="button" data-showpw aria-label="Show password">Show</button></div></div>`;
+const emailField = (id = 'em') => `<div class="field"><label for="${id}">Email</label><div class="inwrap">${ic('mail', 18)}<input id="${id}" type="email" autocomplete="username" placeholder="you@company.com" maxlength="254" required></div></div>`;
+
+function renderLogin() {
+  authShell(`<form class="auth-card" id="lf" novalidate>
         <h1>Sign in</h1><p class="lead">Access your invoices, payments and reports.</p>
         <div class="stack">
-          <div class="field"><label for="em">Email</label><div class="inwrap">${ic('mail', 18)}<input id="em" type="email" autocomplete="username" placeholder="you@company.com" required></div></div>
-          <div class="field"><label for="pw">Password</label><div class="inwrap pwwrap">${ic('lock', 18)}<input id="pw" type="password" autocomplete="current-password" placeholder="Enter your password" required><button type="button" id="sp" aria-label="Show password">Show</button></div></div>
+          ${emailField()}
+          ${pwField('pw', 'Password', 'current-password', 'Enter your password')}
+          <div class="ob-err hidden" role="alert"></div>
           <button class="btn primary" id="sb">Sign in</button>
+          <p class="ob-alt">New here? <a href="#" data-go="signup">Create an account</a></p>
           <p class="secure">${ic('lock', 13)} Encrypted sign-in · your data stays private</p>
         </div>
-      </form>
-    </section></div>`;
-  $('#sp').onclick = () => { const p = $('#pw'), show = p.type === 'password'; p.type = show ? 'text' : 'password'; $('#sp').textContent = show ? 'Hide' : 'Show'; };
-  $('#lf').onsubmit = guard(async (e) => {
-    e.preventDefault();
-    $('#sb').disabled = true;
-    try {
-      const r = await api('/login', { method: 'POST', body: { email: $('#em').value, password: $('#pw').value } });
-      S.token = r.token; localStorage.setItem('token', r.token);
-      await boot();
-    } finally { const b = $('#sb'); if (b) b.disabled = false; }
+      </form>`);
+  $('#lf').onsubmit = submitter($('#lf'), async () => {
+    if (!$('#em').value.trim() || !$('#pw').value) throw new Error('Enter your email and password');
+    const r = await api('/login', { method: 'POST', body: { email: $('#em').value, password: $('#pw').value } });
+    S.token = r.token; localStorage.setItem('token', r.token);
+    await boot();
   });
 }
 
@@ -155,25 +188,26 @@ const NAV = [
   { id: 'recurring', label: 'Recurring', icon: 'repeat', perm: 'recurring.view', hash: '#/recurring', grp: 'Sales' },
   { id: 'reminders', label: 'Reminders', icon: 'bell', perm: 'reminders.view', hash: '#/reminders', badge: true, grp: 'Sales' },
   { id: 'expenses', label: 'Expenses', icon: 'wallet', perm: 'expenses.view', hash: '#/expenses', grp: 'Money' },
-  { id: 'gst', label: 'GST report', icon: 'percent', perm: 'gst.view', hash: '#/gst', grp: 'Money' },
+  { id: 'gst', label: 'GST report', icon: 'percent', perm: 'gst.view', hash: '#/gst', grp: 'Reports' },
+  { id: 'activity', label: 'Activity log', icon: 'clock', perm: 'activity.view', hash: '#/activity', grp: 'Reports' },
   { id: 'clients', label: 'Clients', icon: 'users', perm: 'clients.view', hash: '#/clients', grp: 'Setup' },
   { id: 'products', label: 'Services', icon: 'box', perm: 'products.view', hash: '#/products', grp: 'Setup' },
   { id: 'templates', label: 'Templates', icon: 'chat', perm: 'templates.view', hash: '#/templates', grp: 'Setup' },
   { id: 'users', label: 'Users', icon: 'user', perm: 'users.view', hash: '#/users', grp: 'Admin' },
-  { id: 'roles', label: 'Roles', icon: 'lock', perm: 'roles.view', hash: '#/roles', grp: 'Admin' },
-  { id: 'activity', label: 'Activity log', icon: 'clock', perm: 'activity.view', hash: '#/activity', grp: 'Admin' },
-  { id: 'settings', label: 'Settings', icon: 'gear', perm: null, hash: '#/settings', grp: 'Admin' },
+  { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', hash: '#/settings', grp: 'Admin' },
+  { id: 'management', label: 'Management', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management' },
 ];
 async function refreshBadge() {
   try { S.badge = (await api('/reminders/summary')).queue_count || 0; } catch { S.badge = 0; }
   $$('[data-badge]').forEach((b) => { b.textContent = S.badge; b.classList.toggle('hidden', !S.badge); });
 }
 function renderShell() {
-  const items = NAV.filter((n) => !n.perm || can(n.perm));
+  const items = NAV.filter((n) => (n.perm ? can(n.perm) : !!S.user.membership && S.user.membership.status === 'approved'));
   const link = (n, cls) => `<a class="${cls}" data-nav="${n.id}" href="${n.hash}"><span class="ico">${ic(n.icon)}</span><span class="lb">${n.label}</span>${n.badge ? '<span class="badge hidden" data-badge></span>' : ''}</a>`;
-  const bottom = ['dashboard', 'invoices', 'payments', 'reminders'].map((id) => items.find((n) => n.id === id)).filter(Boolean);
+  const bottom = ['dashboard', 'invoices', 'payments'] /* + centre mic + More (Reminders etc. are in More) */.map((id) => items.find((n) => n.id === id)).filter(Boolean);
   $('#app').innerHTML = `<div class="shell">
     <aside class="side"><div class="brand">${LOGO} Invoice Manager</div>
+      ${S.user.membership?.status === 'approved' ? `<button type="button" class="side-mic" data-mic aria-label="Voice"><span>${ic('mic', 22, 2.6)}</span>Voice</button>` : ''}
       ${items.map((n, i) => (i && items[i - 1].grp === n.grp ? '' : `<div class="navgrp">${n.grp}</div>`) + link(n, 'nav')).join('')}<div class="grow"></div>
       <div class="userchip">${avatar(S.user.name, 'sm')}<div style="flex:1;min-width:0"><div style="font-weight:600;font-size:13.5px">${esc(S.user.name)}</div><div class="small muted">${esc(S.user.role)}</div></div>
         <button class="ibtn" id="so" aria-label="Sign out" title="Sign out">${ic('logout', 18)}</button></div></aside>
@@ -182,7 +216,7 @@ function renderShell() {
       <button class="ibtn" data-theme-btn aria-label="Toggle light / dark theme">${themeIcon()}</button>
       ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new?type=tax">${ic('plus')} Invoice</a>` : ''}</header>
       <main class="content" id="view"></main></div>
-    <nav class="bottom">${bottom.map((n) => link(n, '')).join('')}<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a></nav>
+    <nav class="bottom">${bottom.slice(0, 2).map((n) => link(n, '')).join('')}${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}${bottom.slice(2).map((n) => link(n, '')).join('')}<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a></nav>
     ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new?type=tax" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
   $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
@@ -201,8 +235,16 @@ async function boot() {
   if (!S.token) return renderLogin();
   try {
     S.user = (await api('/me')).user;
-    S.meta = await api('/meta');
-  } catch { return renderLogin(); }
+    const member = S.user.membership?.status === 'approved';
+    if (!member && !S.user.isManagement) return renderMembership();
+    S.meta = member ? await api('/meta') : { states: {}, organisations: [], permissions: {} }; // management-only login
+  } catch { return S.token ? renderOffline() : renderLogin(); }
+  if (S.user.membership?.status !== 'approved') { // management account without an organisation
+    renderShell();
+    if (!location.hash.startsWith('#/management')) location.hash = '#/management';
+    return route();
+  }
+  if (sessionGet('onb')) return resumeSetup();
   renderShell();
   if (!location.hash || location.hash === '#/') location.hash = can('dashboard.view') ? '#/dashboard' : '#/invoices';
   route();
@@ -226,11 +268,11 @@ const routes = [
   [/^#\/products$/, 'products', 'products.view', (el) => crudView(el, CFG.products)],
   [/^#\/templates$/, 'templates', 'templates.view', (el) => crudView(el, CFG.templates)],
   [/^#\/users$/, 'users', 'users.view', (el) => crudView(el, CFG.users)],
-  [/^#\/roles$/, 'roles', 'roles.view', viewRoles],
-  [/^#\/settings$/, 'settings', null, viewSettings],
+  [/^#\/settings$/, 'settings', 'settings.view', viewSettings],
+  [/^#\/management$/, 'management', 'management.view', viewManagement],
 ];
 async function route() {
-  if (!S.user) return;
+  if (!S.user || !$('#view')) return; // onboarding screens have no app shell
   document.body.classList.remove('menu');
   const [path, qs] = location.hash.split('?');
   const q = Object.fromEntries(new URLSearchParams(qs || ''));
@@ -384,6 +426,7 @@ async function viewDashboard(el) {
       <div class="row"><select id="rk" aria-label="Period" class="pillsel">${Object.entries(RANGES).map(([k, v]) => `<option value="${k}" ${k === dashRange.key ? 'selected' : ''}>${v[0]}</option>`).join('')}</select>
         ${can('dashboard.export') ? `<button class="btn" id="ex">${ic('download')} Export</button>` : ''}</div></div>
     <div class="row hidden" id="cr" style="margin-bottom:14px"><input type="date" id="cf" value="${f}" style="width:auto"><span>to</span><input type="date" id="ct" value="${t}" style="width:auto"><button class="btn sm primary" id="cg">Apply</button></div>
+    ${S.user.isAdmin ? '<div id="adm"></div>' : ''}
     <div class="dg">
       <section class="hero c7"><div class="hero-l"><div class="hero-k">Total outstanding</div><div class="hero-v">${money0(d.receivable.s)}</div>
           <div class="hero-s">across ${d.receivable.n} unpaid invoice${d.receivable.n === 1 ? '' : 's'}</div>
@@ -418,6 +461,7 @@ async function viewDashboard(el) {
   if ($('#qe', el)) $('#qe', el).onclick = () => crudForm(CFG.expenses, null, again);
   $$('[data-qp]', el).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); const i = d.dueWeek.find((x) => x.id === +b.dataset.qp); quickPay(i, again); }));
   $$('[data-open]', el).forEach((n) => (n.onclick = () => (location.hash = '#/invoices/' + n.dataset.open)));
+  if ($('#adm', el)) adminPanel($('#adm', el));
 }
 
 function aging(a) {
@@ -448,6 +492,7 @@ function chart(months) {
 
 /* ------------------------------------------------------------ message modal (WhatsApp / email, manual send) */
 let TPL_CACHE = null;
+const mailVia = () => { try { return localStorage.getItem('mailVia') || 'gmail'; } catch { return 'gmail'; } };
 async function openMessage({ client_id, invoice_id, payment_id, kind, channel, rule }) {
   const tpls = (TPL_CACHE = await api('/messages/templates')).filter((t) => (!kind || t.kind === kind) && (!channel || t.channel === channel) && (invoice_id || !/\{\{\s*(invoice_number|invoice_date|due_date|invoice_total|invoice_balance|days_overdue|invoice_link|payment_)/.test(t.body + (t.subject || ''))));
   if (!tpls.length) return toast('No templates yet — create one in Templates.', true);
@@ -456,6 +501,8 @@ async function openMessage({ client_id, invoice_id, payment_id, kind, channel, r
     <div class="field hidden" id="msw"><label>Subject</label><input id="ms"></div>
     <div class="field"><label>Message (edit before sending)</label><textarea id="mb" rows="9"></textarea></div>
     <div class="small muted" id="mi"></div></div>
+    <div class="mail-via hidden" id="mv"><span class="small muted">Open in</span>
+      <button type="button" class="btn sm" data-via="gmail">Gmail</button><button type="button" class="btn sm" data-via="outlook">Outlook</button><button type="button" class="btn sm" data-via="app">Mail app</button></div>
     <div class="actions"><button class="btn" id="mc">${invoice_id ? `${ic('copy')} Copy image` : 'Copy text'}</button><button class="btn" id="mx">Close</button><button class="btn primary" id="mg">Open</button></div>`);
   let cur = null;
   const load = guard(async () => {
@@ -465,10 +512,13 @@ async function openMessage({ client_id, invoice_id, payment_id, kind, channel, r
     $('#mb', m.el).value = cur.text; $('#ms', m.el).value = cur.subject;
     $('#msw', m.el).classList.toggle('hidden', cur.channel !== 'email');
     $('#mi', m.el).textContent = cur.channel === 'email' ? (cur.to_email ? `To: ${cur.to_email}` : 'This client has no email saved.') : (cur.mobile ? `To: +${cur.mobile}` : 'This client has no mobile number — you can pick the contact in WhatsApp.');
-    $('#mg', m.el).textContent = cur.channel === 'email' ? 'Open email app' : 'Open WhatsApp';
+    $('#mv', m.el).classList.toggle('hidden', cur.channel !== 'email');
+    $$('[data-via]', m.el).forEach((b) => b.classList.toggle('on', b.dataset.via === mailVia()));
+    $('#mg', m.el).textContent = cur.channel === 'email' ? `Open in ${{ gmail: 'Gmail', outlook: 'Outlook', app: 'mail app' }[mailVia()]}` : 'Open WhatsApp';
     $('#mg', m.el).className = 'btn ' + (cur.channel === 'email' ? 'primary' : 'wa');
   });
   $('#mt', m.el).onchange = load; load();
+  $$('[data-via]', m.el).forEach((b) => (b.onclick = () => { try { localStorage.setItem('mailVia', b.dataset.via); } catch {} load(); }));
   $('#mx', m.el).onclick = m.close;
   // with an invoice in play, share the invoice picture (paste it in WhatsApp / email); a client-level reminder has no single invoice, so it copies text
   $('#mc', m.el).onclick = invoice_id
@@ -477,11 +527,15 @@ async function openMessage({ client_id, invoice_id, payment_id, kind, channel, r
   $('#mg', m.el).onclick = guard(async () => {
     const text = $('#mb', m.el).value, enc = encodeURIComponent;
     let url;
-    if (cur.channel === 'email') url = `mailto:${enc(cur.to_email)}?subject=${enc($('#ms', m.el).value)}&body=${enc(text)}${cur.cc ? `&cc=${enc(cur.cc)}` : ''}`;
+    const subj = $('#ms', m.el).value, via = mailVia();
+    // Gmail / Outlook open a compose window in the browser; "mail app" needs a default mail program on the computer
+    if (cur.channel === 'email' && via === 'gmail') url = `https://mail.google.com/mail/?view=cm&fs=1&to=${enc(cur.to_email)}&su=${enc(subj)}&body=${enc(text)}${cur.cc ? `&cc=${enc(cur.cc)}` : ''}`;
+    else if (cur.channel === 'email' && via === 'outlook') url = `https://outlook.office.com/mail/deeplink/compose?to=${enc(cur.to_email)}&subject=${enc(subj)}&body=${enc(text)}${cur.cc ? `&cc=${enc(cur.cc)}` : ''}`;
+    else if (cur.channel === 'email') url = `mailto:${enc(cur.to_email)}?subject=${enc(subj)}&body=${enc(text)}${cur.cc ? `&cc=${enc(cur.cc)}` : ''}`;
     else url = `https://wa.me/${cur.mobile || ''}?text=${enc(text)}`;
     if (can('reminders.send')) await api('/messages/log', { method: 'POST', body: { client_id: client_id || null, invoice_id: invoice_id || null, channel: cur.channel, template_id: cur.template_id, rule } }).catch(() => {});
-    if (cur.channel === 'email') location.href = url; else window.open(url, '_blank', 'noopener');
-    toast('Opened — press send in the app');
+    if (url.startsWith('mailto:')) location.href = url; else window.open(url, '_blank', 'noopener');
+    toast(url.startsWith('mailto:') ? 'If nothing opened, pick Gmail or Outlook instead' : 'Opened — press send there');
     m.close();
     refreshBadge();
     if (location.hash === '#/reminders') route();
@@ -920,7 +974,7 @@ async function viewInvoice(el, id) {
   const refresh = () => viewInvoice(el, id);
   const send = (channel) => openMessage({ client_id: v.client_id, invoice_id: v.id, channel, kind: pending > 0.005 && late > 0 ? undefined : 'invoice' });
   const doPay = () => quickPay(v, refresh);
-  const doDelete = guard(async () => { if (!confirmBox('Delete this invoice and its payments? This cannot be undone.')) return; await api('/invoices/' + id, { method: 'DELETE' }); toast('Deleted'); location.hash = '#/invoices'; refreshBadge(); });
+  const doDelete = guard(async () => { if (!(await confirmBox('Delete this invoice and its payments? This cannot be undone.'))) return; await api('/invoices/' + id, { method: 'DELETE' }); toast('Deleted'); location.hash = '#/invoices'; refreshBadge(); });
   const table = {
     'a-pdf': () => window.print(), 'a-img': () => copyInvoiceImage(v), 'a-em': () => send('email'), 'a-sh': guard(() => shareModal(v, refresh)),
     'a-rc': () => recurringModal({ invoice_id: v.id, invoice_date: v.invoice_date, due_days: v.due_date ? Math.max(0, Math.round((Date.parse(v.due_date) - Date.parse(v.invoice_date)) / 864e5)) : 7 }, () => (location.hash = '#/recurring')),
@@ -934,9 +988,9 @@ async function viewInvoice(el, id) {
   if ($('#ap2')) $('#ap2').onclick = doPay;
   if ($('#wa')) $('#wa').onclick = () => send('whatsapp');
   $('#cp').onclick = () => copyInvoiceImage(v);
-  if ($('#cv')) $('#cv').onclick = guard(async () => { if (!confirmBox('Create a tax invoice from this proforma?')) return; const r = await api(`/invoices/${id}/convert`, { method: 'POST' }); toast('Tax invoice created'); S.justCreated = r.id; location.hash = '#/invoices/' + r.id; });
+  if ($('#cv')) $('#cv').onclick = guard(async () => { if (!(await confirmBox('Create a tax invoice from this proforma?'))) return; const r = await api(`/invoices/${id}/convert`, { method: 'POST' }); toast('Tax invoice created'); S.justCreated = r.id; location.hash = '#/invoices/' + r.id; });
   $$('[data-rc]', el).forEach((b) => (b.onclick = () => openMessage({ client_id: v.client_id, invoice_id: v.id, payment_id: +b.dataset.rc, kind: 'receipt' })));
-  $$('[data-dp]', el).forEach((b) => (b.onclick = guard(async () => { if (!confirmBox('Delete this payment?')) return; await api('/payments/' + b.dataset.dp, { method: 'DELETE' }); refreshBadge(); refresh(); })));
+  $$('[data-dp]', el).forEach((b) => (b.onclick = guard(async () => { if (!(await confirmBox('Delete this payment?'))) return; await api('/payments/' + b.dataset.dp, { method: 'DELETE' }); refreshBadge(); refresh(); })));
   if (S.justCreated === v.id) { S.justCreated = null; setTimeout(() => createdSheet(v), 250); }
 }
 
@@ -999,12 +1053,15 @@ const STATE_OPTS = () => Object.entries(S.meta.states).map(([c, n]) => ({ v: c, 
 const CFG = {
   clients: {
     title: 'Clients', api: '/clients', perm: 'clients', noun: 'client', onOpen: gstHelper,
-    cols: [{ k: 'name', l: 'Name', first: true }, { k: 'contact_person', l: 'Contact' }, { k: 'mobile', l: 'Mobile' }, { k: 'email', l: 'Email' }, { k: 'gst_number', l: 'GSTIN' }],
+    cols: [{ k: 'name', l: 'Name', first: true }, { k: 'contact_person', l: 'Contact' }, { k: 'mobile', l: 'Mobile' }, { k: 'email', l: 'Email' }, { k: 'gst_number', l: 'GSTIN' },
+      { k: 'status', l: 'Status', raw: 1, f: (v) => ({ inactive: '<span class="pill unpaid">Inactive</span>', on_hold: '<span class="pill partial">On hold</span>' }[v] || '<span class="pill paid">Active</span>') }],
     fields: [
       { k: 'name', l: 'Company name', req: 1, full: 1 }, { k: 'contact_person', l: 'Contact person' }, { k: 'mobile', l: 'Mobile (WhatsApp)', ph: '9876543210' },
       { k: 'email', l: 'Email', t: 'email' }, { k: 'gst_number', l: 'GSTIN', ph: '06AAAAA0000A1Z5' }, { k: 'pan_number', l: 'PAN' },
       { k: 'address', l: 'Address', t: 'textarea', full: 1 }, { k: 'state_code', l: 'State (auto from GSTIN)', t: 'select', opts: STATE_OPTS, blank: 1, full: 1 },
+      { k: 'status', l: 'Status', t: 'select', opts: [{ v: 'active', l: 'Active' }, { v: 'inactive', l: 'Inactive' }, { v: 'on_hold', l: 'On hold' }] },
     ],
+    defaults: { status: 'active' },
   },
   products: {
     title: 'Services & products', api: '/products', perm: 'products', noun: 'service',
@@ -1044,11 +1101,11 @@ const CFG = {
   },
   users: {
     title: 'Users', api: '/users', perm: 'users', noun: 'user',
-    cols: [{ k: 'name', l: 'Name', first: true }, { k: 'email', l: 'Email' }, { k: 'role', l: 'Role' }, { k: 'active', l: 'Status', f: (v) => (v ? '<span class="pill paid">Active</span>' : '<span class="pill unpaid">Disabled</span>'), raw: 1 }],
+    cols: [{ k: 'name', l: 'Name', first: true }, { k: 'email', l: 'Email' }, { k: 'role', l: 'User type' }, { k: 'active', l: 'Status', f: (v) => (v ? '<span class="pill paid">Active</span>' : '<span class="pill unpaid">Disabled</span>'), raw: 1 }],
     fields: [
       { k: 'name', l: 'Name', req: 1 }, { k: 'email', l: 'Email', t: 'email', req: 1 },
       { k: 'password', l: 'Password (min 6)', t: 'password', reqNew: 1, ph: 'leave blank to keep', noFill: 1 },
-      { k: 'role_id', l: 'Role', t: 'select', opts: async () => (await api('/roles')).map((r) => ({ v: r.id, l: r.name })), req: 1 },
+      { k: 'role_id', l: 'User type', t: 'select', opts: async () => (await api('/roles')).map((r) => ({ v: r.id, l: r.name })), req: 1 },
       { k: 'active', l: 'Active', t: 'checkbox' },
     ],
     defaults: { active: 1 },
@@ -1101,7 +1158,7 @@ async function crudView(el, cfg) {
   if ($('#add', el)) $('#add', el).onclick = () => crudForm(cfg, null, reload);
   $$('[data-e]', el).forEach((b) => (b.onclick = () => crudForm(cfg, rows.find((r) => r.id === +b.dataset.e), reload)));
   $$('[data-d]', el).forEach((b) => (b.onclick = guard(async () => {
-    if (!confirmBox(`Delete this ${cfg.noun}?`)) return;
+    if (!(await confirmBox(`Delete this ${cfg.noun}?`))) return;
     await api(`${cfg.api}/${b.dataset.d}`, { method: 'DELETE' }); toast('Deleted'); cfg.after && (await cfg.after()); reload();
   })));
 }
@@ -1140,7 +1197,7 @@ async function crudForm(cfg, row, done, onCancel) {
   });
   $('[data-x]', m.el).onclick = m.close;
   if ($('[data-del]', m.el)) $('[data-del]', m.el).onclick = guard(async () => {
-    if (!confirmBox(`Delete this ${cfg.noun}?`)) return;
+    if (!(await confirmBox(`Delete this ${cfg.noun}?`))) return;
     await api(`${cfg.api}/${row.id}`, { method: 'DELETE' }); saved = true; m.close(); toast('Deleted'); cfg.after && (await cfg.after()); done(null);
   });
   cfg.onOpen && cfg.onOpen(form);
@@ -1159,37 +1216,11 @@ async function crudForm(cfg, row, done, onCancel) {
   });
 }
 
-/* ------------------------------------------------------------ roles (RBAC matrix) */
-async function viewRoles(el) {
-  const roles = await api('/roles');
-  el.innerHTML = `<div class="pagehead"><div><h1>Roles &amp; permissions</h1><div class="muted small">Choose what each role can see and do. The Admin role always has full access.</div></div>
-    ${can('roles.create') ? '<button class="btn primary" id="add">+ Add role</button>' : ''}</div>
-    <div class="stack">${roles.map((r) => { const admin = r.permissions.includes('*'); return `<div class="card row sp"><div><h3>${esc(r.name)}</h3><div class="small muted">${admin ? 'Full access' : r.permissions.length + ' permissions'}</div></div>
-      <div class="row">${!admin && can('roles.edit') ? `<button class="btn sm" data-e="${r.id}">Edit permissions</button>` : ''}${!admin && can('roles.delete') ? `<button class="btn sm danger" data-d="${r.id}">Delete</button>` : ''}</div></div>`; }).join('')}</div>`;
-  if ($('#add', el)) $('#add', el).onclick = () => roleForm(null, () => viewRoles(el));
-  $$('[data-e]', el).forEach((b) => (b.onclick = () => roleForm(roles.find((r) => r.id === +b.dataset.e), () => viewRoles(el))));
-  $$('[data-d]', el).forEach((b) => (b.onclick = guard(async () => { if (!confirmBox('Delete this role?')) return; await api('/roles/' + b.dataset.d, { method: 'DELETE' }); viewRoles(el); })));
-}
-function roleForm(role, done) {
-  const perms = S.meta.permissions, acts = [...new Set(Object.values(perms).flat())];
-  const has = (k) => role?.permissions.includes(k);
-  const m = modal(`<h2>${role ? 'Edit' : 'New'} role</h2><form class="stack"><div class="field"><label>Role name</label><input name="name" value="${esc(role?.name || '')}" required></div>
-    <div class="tablewrap"><table class="matrix"><thead><tr><th>Module</th>${acts.map((a) => `<th>${a}</th>`).join('')}</tr></thead><tbody>
-    ${Object.entries(perms).map(([mod, list]) => `<tr><td><b>${mod}</b></td>${acts.map((a) => `<td>${list.includes(a) ? `<input type="checkbox" value="${mod}.${a}" ${has(`${mod}.${a}`) ? 'checked' : ''} aria-label="${mod} ${a}">` : ''}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-    <div class="actions"><button type="button" class="btn" data-x>Cancel</button><button class="btn primary">Save</button></div></form>`);
-  $('[data-x]', m.el).onclick = m.close;
-  $('form', m.el).onsubmit = guard(async (e) => {
-    e.preventDefault();
-    const body = { name: e.target.elements.name.value, permissions: $$('input[type=checkbox]:checked', m.el).map((c) => c.value) };
-    await api(role ? '/roles/' + role.id : '/roles', { method: role ? 'PUT' : 'POST', body });
-    m.close(); toast('Saved'); done();
-  });
-}
-
 /* ------------------------------------------------------------ settings */
 async function viewSettings(el) {
   el.innerHTML = `<div class="pagehead"><h1>Settings</h1></div>
-    <div id="s1" style="margin-top:22px"></div><div id="s2" style="margin-top:22px"></div>`;
+    ${S.user.isAdmin ? '<div id="s0" style="margin-top:22px"></div>' : ''}<div id="s1" style="margin-top:22px"></div><div id="s2" style="margin-top:22px"></div>`;
+  if (S.user.isAdmin) await inviteCard($('#s0'));
   if (can('settings.view')) { await crudView($('#s1'), CFG.organisations); await crudView($('#s2'), CFG.ccEmails); }
 }
 
@@ -1275,10 +1306,10 @@ async function viewRecurring(el) {
         ${r.last_invoice_id ? `<a class="btn sm" href="#/invoices/${r.last_invoice_id}">Last invoice →</a>` : ''}${can('recurring.delete') ? `<button class="btn sm danger" data-del="${r.id}">Delete</button>` : ''}</div></div>`).join('') + pg.html : '<div class="empty card">No recurring invoices yet.</div>'}</div>`;
   const again = () => viewRecurring(el);
   pg.bind(el, again);
-  $$('[data-run]', el).forEach((b) => (b.onclick = guard(async () => { if (!confirmBox('Generate the next invoice now (dated today)?')) return; const r = await api(`/recurring/${b.dataset.run}/run`, { method: 'POST' }); toast('Invoice created'); location.hash = '#/invoices/' + r.id; })));
+  $$('[data-run]', el).forEach((b) => (b.onclick = guard(async () => { if (!(await confirmBox('Generate the next invoice now (dated today)?'))) return; const r = await api(`/recurring/${b.dataset.run}/run`, { method: 'POST' }); toast('Invoice created'); location.hash = '#/invoices/' + r.id; })));
   $$('[data-tg]', el).forEach((b) => (b.onclick = guard(async () => { await api('/recurring/' + b.dataset.tg, { method: 'PUT', body: { active: b.dataset.on !== '1' } }); again(); })));
   $$('[data-ed]', el).forEach((b) => (b.onclick = () => recurringModal({ row: list.find((x) => x.id === +b.dataset.ed) }, again)));
-  $$('[data-del]', el).forEach((b) => (b.onclick = guard(async () => { if (!confirmBox('Delete this schedule? Existing invoices stay.')) return; await api('/recurring/' + b.dataset.del, { method: 'DELETE' }); again(); })));
+  $$('[data-del]', el).forEach((b) => (b.onclick = guard(async () => { if (!(await confirmBox('Delete this schedule? Existing invoices stay.'))) return; await api('/recurring/' + b.dataset.del, { method: 'DELETE' }); again(); })));
 }
 
 /* ------------------------------------------------------------ GST report */
@@ -1334,7 +1365,7 @@ async function shareModal(v, refresh) {
     <div class="actions"><button class="btn danger" id="sd">Disable link</button><button class="btn" id="sc">Copy link</button>${can('reminders.send') ? '<button class="btn wa" id="sw">Send on WhatsApp</button><button class="btn" id="se">Email</button>' : ''}</div>`);
   $('#su', m.el).onfocus = (e) => e.target.select();
   $('#sc', m.el).onclick = () => navigator.clipboard?.writeText(url).then(() => toast('Link copied'), () => { $('#su', m.el).select(); toast('Press Ctrl+C to copy'); });
-  $('#sd', m.el).onclick = guard(async () => { if (!confirmBox('Disable this link? Anyone who has it will lose access.')) return; await api(`/invoices/${v.id}/share`, { method: 'DELETE' }); m.close(); toast('Link disabled'); refresh(); });
+  $('#sd', m.el).onclick = guard(async () => { if (!(await confirmBox('Disable this link? Anyone who has it will lose access.'))) return; await api(`/invoices/${v.id}/share`, { method: 'DELETE' }); m.close(); toast('Link disabled'); refresh(); });
   if ($('#sw', m.el)) { $('#sw', m.el).onclick = () => { m.close(); openMessage({ client_id: v.client_id, invoice_id: v.id, channel: 'whatsapp', kind: 'invoice' }); }; $('#se', m.el).onclick = () => { m.close(); openMessage({ client_id: v.client_id, invoice_id: v.id, channel: 'email', kind: 'invoice' }); }; }
 }
 function creditModal(v, refresh) {
@@ -1358,6 +1389,450 @@ function askReceipt(v, paymentId) {
   $('#rw', m.el).onclick = go('whatsapp'); $('#re', m.el).onclick = go('email');
 }
 
+
+/* ------------------------------------------------------------ voice assistant */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const VOICE = { history: [], lang: (() => { try { return localStorage.getItem('voiceLang2') || 'en-IN'; } catch { return 'en-IN'; } })() };
+const YES = /^(yes|yeah|yep|ok(ay)?|confirm|do it|haan?|haa|ha ji|haanji|ji haan|theek hai|thik hai|kar do|karo|हाँ|हां|हा|जी|ठीक है|कर दो)[\s.!।]*$/i;
+const NO = /^(no|nope|cancel|stop|nahi|nahin|mat karo|rehne do|नहीं|नही|मत|रहने दो)[\s.!।]*$/i;
+function speak(text) {
+  if (!('speechSynthesis' in window) || !text) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  // voice follows the reply's own script, not the mic toggle: Devanagari -> Hindi voice, anything else -> Indian English voice
+  u.lang = /[\u0900-\u097F]/.test(text) ? 'hi-IN' : 'en-IN';
+  const vs = speechSynthesis.getVoices();
+  const v = vs.find((x) => x.lang === u.lang) || vs.find((x) => x.lang.startsWith(u.lang.slice(0, 2)));
+  if (v) u.voice = v;
+  speechSynthesis.speak(u);
+}
+function openVoice() {
+  if ($('.vx')) return;
+  if (S.user?.membership?.status !== 'approved') return toast('Voice works inside an organisation', true);
+  let rec = null, listening = false, pend = null, busy = false;
+  const m = modal(`<div class="vx"><div class="row sp"><h2>Voice assistant</h2><div class="vx-lang" role="group" aria-label="Language">
+        <button type="button" data-l="en-IN" title="English and Hinglish">English</button><button type="button" data-l="hi-IN" title="Hindi (Devanagari)">हिंदी</button></div></div>
+      <div class="vx-log" id="vlog" aria-live="polite"><div class="vx-hint">Try: <i>"Tata Motors ka status inactive kar do"</i>, <i>"How much is overdue?"</i>, <i>"ZOHO ke invoice ka payment full receive ho gaya"</i></div></div>
+      <div class="vx-live" id="vlive"></div>
+      <div class="vx-bar"><button type="button" class="vx-mic" id="vmic" aria-label="Speak">${ic('mic', 30, 2.6)}</button>
+        <form id="vf" class="vx-type"><input id="vt" placeholder="${SR ? 'Or type a command…' : 'Type a command (voice needs Chrome or Edge)'}" autocomplete="off" maxlength="600"><button class="btn primary sm" aria-label="Send">${ic('send', 16)}</button></form></div>
+      <div class="vx-status small muted" id="vst">${SR ? 'Tap the mic and speak' : 'Speech recognition is not supported in this browser'}</div></div>`,
+    { onClose: () => { try { rec && rec.abort(); } catch {} if ('speechSynthesis' in window) speechSynthesis.cancel(); } });
+  const log = $('#vlog', m.el), live = $('#vlive', m.el), st = $('#vst', m.el), micB = $('#vmic', m.el);
+  const setLang = (l, save) => { VOICE.lang = l; if (save) try { localStorage.setItem('voiceLang2', l); } catch {} $$('[data-l]', m.el).forEach((b) => b.classList.toggle('on', b.dataset.l === l)); };
+  setLang(VOICE.lang);
+  $$('[data-l]', m.el).forEach((b) => (b.onclick = () => setLang(b.dataset.l, true)));
+  const bubble = (who, html) => { $('.vx-hint', log)?.remove(); const d = document.createElement('div'); d.className = 'vx-msg ' + who; d.innerHTML = html; log.append(d); log.scrollTop = log.scrollHeight; return d; };
+  const status = (t) => (st.textContent = t);
+
+  async function confirmPending(ok) {
+    const p = pend; pend = null;
+    $$('.vx-card button', log).forEach((b) => (b.disabled = true));
+    try {
+      const r = await api('/voice/confirm', { method: 'POST', body: { id: p.id, cancel: !ok } });
+      bubble('bot', esc(r.reply)); speak(r.reply); VOICE.history.push({ role: 'assistant', text: r.reply });
+      if (ok) {
+        refreshBadge();
+        if (r.compose) setTimeout(() => { m.close(); openMessage(r.compose); }, 900); // saved the missing email -> open the draft
+        else if (r.open) location.hash = r.open; else if (r.refresh) route();
+      }
+    } catch (e) { bubble('bot err', esc(e.message)); speak(e.message); }
+    status('Tap the mic to say something else');
+  }
+  async function send(text, retry = false) {
+    text = text.trim(); if (!text || busy) return;
+    if (!retry && pend && YES.test(text)) { bubble('me', esc(text)); return confirmPending(true); }
+    if (!retry && pend && NO.test(text)) { bubble('me', esc(text)); return confirmPending(false); }
+    if (pend) { api('/voice/confirm', { method: 'POST', body: { id: pend.id, cancel: true } }).catch(() => {}); pend = null; $$('.vx-card button', log).forEach((b) => (b.disabled = true)); }
+    if (!retry) bubble('me', esc(text));
+    busy = true; micB.disabled = true; status('Thinking…');
+    const wait = bubble('bot wait', '<span class="vx-dots"><i></i><i></i><i></i></span>');
+    try {
+      const r = await api('/voice/command', { method: 'POST', body: { text, history: VOICE.history } });
+      wait.remove();
+      VOICE.history.push({ role: 'user', text }, { role: 'assistant', text: r.reply });
+      VOICE.history = VOICE.history.slice(-8);
+      const b = bubble('bot', esc(r.reply));
+      speak(r.reply);
+      if (r.pending) {
+        pend = r.pending;
+        const card = document.createElement('div'); card.className = 'vx-card';
+        card.innerHTML = `<div class="small muted">Confirm this change</div><b>${esc(r.pending.summary)}</b><div class="row"><button class="btn sm" data-n>Cancel</button><button class="btn sm primary" data-y>${ic('check', 15)} Confirm</button></div>`;
+        b.append(card);
+        $('[data-y]', card).onclick = () => confirmPending(true);
+        $('[data-n]', card).onclick = () => confirmPending(false);
+        status('Say "haan / yes" to confirm, or "nahi / no" to cancel');
+        log.scrollTop = log.scrollHeight;
+      } else status('Tap the mic to say something else');
+      if (r.navigate) setTimeout(() => (location.hash = r.navigate), 600);
+      // email / WhatsApp: hand over to the normal "Send" window with the template already filled in
+      if (r.compose) setTimeout(() => { m.close(); openMessage(r.compose); }, 900);
+    } catch (e) {
+      wait.remove();
+      // failed request: offer to resend the same words without speaking again
+      const b = bubble('bot err', `<div>${esc(e.message)}</div><button type="button" class="btn sm vx-retry">${ic('repeat', 14)} Retry</button>`);
+      $('.vx-retry', b).onclick = () => { b.remove(); send(text, true); };
+      status('Tap Retry, or speak again');
+    }
+    finally { busy = false; micB.disabled = false; }
+  }
+  function listen() {
+    if (!SR) return toast('Voice input needs Chrome or Edge — you can type instead', true);
+    if (listening) { rec.stop(); return; }
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    rec = new SR(); rec.lang = VOICE.lang; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+    let finalText = '', errored = false;
+    rec.onstart = () => { listening = true; micB.classList.add('on'); status(VOICE.lang === 'hi-IN' ? 'सुन रहा हूँ… (listening)' : 'Listening…'); };
+    rec.onresult = (e) => { let t = ''; for (const r of e.results) { t += r[0].transcript; if (r.isFinal) finalText = t; } live.textContent = t; };
+    rec.onerror = (e) => { errored = true; status(e.error === 'not-allowed' ? 'Microphone permission was blocked — allow it in the browser' : e.error === 'no-speech' ? "Didn't catch that — tap and try again" : 'Voice error: ' + e.error); };
+    rec.onend = () => { listening = false; micB.classList.remove('on'); const t = (finalText || live.textContent).trim(); live.textContent = ''; if (t) send(t); else if (!errored && !busy) status('Tap the mic and speak'); };
+    try { rec.start(); } catch { status('Mic is busy — try again'); }
+  }
+  micB.onclick = listen;
+  $('#vf', m.el).onsubmit = (e) => { e.preventDefault(); const v = $('#vt', m.el).value; $('#vt', m.el).value = ''; send(v); };
+  if (SR) setTimeout(listen, 250); // start listening straight away
+}
+
+/* ------------------------------------------------------------ platform management */
+let mgmtQ = '';
+async function viewManagement(el) {
+  const d = await api('/management/organisations');
+  const tile = (icn, tone, label, val) => `<div class="stat ${tone}"><span class="stat-ic">${ic(icn, 19)}</span><div class="stat-b"><div class="stat-l">${label}</div><div class="stat-v">${val}</div></div></div>`;
+  const yes = (v) => (v ? '<span class="pill paid">Done</span>' : '<span class="pill unpaid">Skipped</span>');
+  const draw = () => {
+    const q = mgmtQ.toLowerCase();
+    const rows = d.rows.filter((r) => !q || `${r.name} ${r.creator_email} ${r.invite_code} ${r.gst_number || ''}`.toLowerCase().includes(q));
+    const pg = paginate('mgmt', rows);
+    $('#mt', el).innerHTML = rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable mgmt"><thead><tr>
+        <th>Organisation</th><th>Created by</th><th>Created</th><th>Code</th><th class="num">Members</th><th class="num">Pending</th><th class="num">Clients</th><th class="num">Invoices</th><th class="num">Billed</th><th class="num">Outstanding</th><th>Details</th><th>Bank</th><th>Last activity</th></tr></thead><tbody>
+      ${pg.rows.map((r) => `<tr><td class="first" data-label="Organisation"><b>${esc(r.name)}</b>${r.gst_number ? `<div class="small muted">${esc(r.gst_number)}</div>` : ''}</td>
+        <td data-label="Created by">${esc(r.creator_name || '—')}<div class="small muted">${esc(r.creator_email || '')}</div></td>
+        <td data-label="Created" class="nowrap">${fmtLong(r.created_at)}</td><td data-label="Code"><code>${esc(r.invite_code)}</code></td>
+        <td class="num" data-label="Members">${r.members}<div class="small muted">${r.admins} admin</div></td>
+        <td class="num" data-label="Pending">${r.pending ? `<span class="pill partial">${r.pending}</span>` : 0}${r.rejected ? `<div class="small muted">${r.rejected} rejected</div>` : ''}</td>
+        <td class="num" data-label="Clients">${r.clients}</td><td class="num" data-label="Invoices">${r.invoices}</td>
+        <td class="num" data-label="Billed">${money0(r.billed)}</td><td class="num" data-label="Outstanding">${money0(r.outstanding)}</td>
+        <td data-label="Details">${yes(r.has_details)}</td><td data-label="Bank">${yes(r.has_bank)}</td>
+        <td data-label="Last activity" class="nowrap">${r.last_activity ? fmtLong(r.last_activity) : '—'}</td></tr>`).join('')}</tbody></table></div>${pg.html}`
+      : '<div class="empty card">No organisations match.</div>';
+    pg.bind(el, draw);
+  };
+  el.innerHTML = `<div class="pagehead"><div><h1>Management</h1><div class="muted small">Every organisation on this installation. Bank details are never shown here.</div></div>
+      <button class="btn" id="mx">${ic('download')} Export CSV</button></div>
+    <div class="mgmt-stats">${tile('grid', 'brand', 'Organisations', d.totals.organisations)}${tile('users', 'ok', 'Active members', d.totals.members)}
+      ${tile('clock', 'bad', 'Pending requests', d.totals.pending)}${tile('file', 'grey', 'Invoices', d.totals.invoices)}${tile('rupee', 'brand', 'Total billed', money0(d.totals.billed))}</div>
+    <div class="inwrap" style="margin:16px 0 12px;max-width:360px">${ic('search', 18)}<input id="mq" placeholder="Search organisation, email, code…" value="${esc(mgmtQ)}"></div>
+    <div id="mt"></div>`;
+  $('#mq', el).oninput = (e) => { mgmtQ = e.target.value; resetPg('mgmt'); draw(); };
+  $('#mx', el).onclick = () => {
+    const head = ['Organisation', 'GSTIN', 'Created by', 'Creator email', 'Created', 'Invite code', 'Members', 'Admins', 'Pending', 'Rejected', 'Clients', 'Invoices', 'Billed', 'Outstanding', 'Details', 'Bank', 'Last activity'];
+    const cell = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const lines = [head, ...d.rows.map((r) => [r.name, r.gst_number, r.creator_name, r.creator_email, r.created_at, r.invite_code, r.members, r.admins, r.pending, r.rejected, r.clients, r.invoices, r.billed, r.outstanding, r.has_details ? 'yes' : 'no', r.has_bank ? 'yes' : 'no', r.last_activity])];
+    downloadBlob(new Blob(['\ufeff' + lines.map((l) => l.map(cell).join(',')).join('\r\n')], { type: 'text/csv' }), 'organisations.csv');
+  };
+  draw();
+}
+
+/* ------------------------------------------------------------ organisation signup, join & approval */
+const sessionGet = (k) => { try { return sessionStorage.getItem(k); } catch { return null; } };
+const sessionSet = (k, v) => { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} };
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const pwProblem = (pw) => (pw.length < 8 ? 'Password must be at least 8 characters' : !/[A-Za-z]/.test(pw) || !/\d/.test(pw) ? 'Password must include at least one letter and one number' : '');
+
+// Submit handler with inline error, loading label and double-submit protection.
+function submitter(form, fn) {
+  let busy = false;
+  return async (e) => {
+    e && e.preventDefault();
+    if (busy) return;
+    const btn = $('button.primary', form), err = $('.ob-err', form), label = btn?.innerHTML;
+    busy = true; if (btn) { btn.disabled = true; btn.innerHTML = 'Please wait…'; }
+    if (err) err.classList.add('hidden');
+    try { await fn(); }
+    catch (x) { if (err && err.isConnected) { err.textContent = x.message; err.classList.remove('hidden'); } else toast(x.message, true); }
+    finally { busy = false; if (btn && btn.isConnected) { btn.disabled = false; btn.innerHTML = label; } }
+  };
+}
+const steps = (n) => `<div class="ob-steps" aria-label="Step ${n} of 4">${['Account', 'Organisation', 'Bank', 'Code'].map((s, i) => `<span class="${i + 1 < n ? 'done' : i + 1 === n ? 'on' : ''}">${s}</span>`).join('')}</div>`;
+const signInAs = async (token) => { S.token = token; localStorage.setItem('token', token); S.user = (await api('/me')).user; };
+
+function renderOffline() {
+  authShell(`<div class="auth-card"><h1>Can't connect</h1><p class="lead">We couldn't reach the server. Check your connection.</p>
+    <div class="stack"><button class="btn primary" id="rt">Try again</button><button class="btn" id="so2">Sign out</button></div></div>`);
+  $('#rt').onclick = () => boot();
+  $('#so2').onclick = () => signOut();
+}
+
+function renderSignup() {
+  authShell(`<div class="auth-card">
+      <h1>Create your account</h1><p class="lead">How would you like to get started?</p>
+      <div class="ob-choices">
+        <button type="button" class="ob-choice" data-go="create"><span class="ob-ic">${ic('plus', 20)}</span><span><b>Create a new organisation</b><small>Set up invoicing for your business. You'll be its admin.</small></span>${ic('chevron', 18)}</button>
+        <button type="button" class="ob-choice" data-go="join"><span class="ob-ic">${ic('users', 20)}</span><span><b>Join an existing organisation</b><small>Use the code your admin shared with you.</small></span>${ic('chevron', 18)}</button>
+      </div>
+      <p class="ob-alt">Already have an account? <a href="#" data-go="login">Sign in</a></p>
+    </div>`);
+}
+
+function renderCreateAccount() {
+  authShell(`<form class="auth-card" id="ca" novalidate>${steps(1)}
+      <h1>Your account</h1><p class="lead">You'll be the admin of your new organisation.</p>
+      <div class="stack">
+        <div class="field"><label for="nm">Your name</label><div class="inwrap">${ic('user', 18)}<input id="nm" autocomplete="name" placeholder="Full name" maxlength="80" required></div></div>
+        ${emailField()}
+        ${pwField('pw', 'Password', 'new-password', 'At least 8 characters, with a number')}
+        ${pwField('pw2', 'Confirm password', 'new-password', 'Type it again')}
+        <div class="ob-err hidden" role="alert"></div>
+        <button class="btn primary">Create account</button>
+        <p class="ob-alt"><a href="#" data-go="signup">← Back</a> · Have an account? <a href="#" data-go="login">Sign in</a></p>
+      </div></form>`);
+  $('#ca').onsubmit = submitter($('#ca'), async () => {
+    const name = $('#nm').value.trim(), email = $('#em').value.trim(), pw = $('#pw').value;
+    if (!name) throw new Error('Enter your name');
+    if (!EMAIL_RE.test(email)) throw new Error('Enter a valid email address');
+    if (pwProblem(pw)) throw new Error(pwProblem(pw));
+    if (pw !== $('#pw2').value) throw new Error('Passwords do not match');
+    const r = await api('/signup', { method: 'POST', body: { name, email, password: pw, confirm: $('#pw2').value } });
+    await signInAs(r.token);
+    sessionSet('onb', 'org');
+    await resumeSetup();
+  });
+}
+
+// Steps 2–4 for a new admin; survives a page refresh through sessionStorage.
+async function resumeSetup() {
+  S.meta = S.meta || (await api('/meta'));
+  const step = sessionGet('onb');
+  if (step === 'bank') return renderBankStep();
+  if (step === 'code') return showInviteCode();
+  return renderOrgStep();
+}
+const primaryOrg = () => [...S.meta.organisations].sort((a, b) => a.id - b.id)[0];
+
+function renderOrgStep() {
+  const o = primaryOrg() || {};
+  const placeholderName = /'s organisation$/.test(o.name || '');
+  const f = (k, l, extra = '') => `<div class="field"><label for="o_${k}">${l}</label><input id="o_${k}" name="${k}" value="${esc(k === 'name' && placeholderName ? '' : o[k] || '')}" ${extra}></div>`;
+  authShell(`<form class="auth-card wide" id="os" novalidate>${steps(2)}
+      <h1>Invoicing Organisation</h1><p class="lead">These details print on your invoices. You can change them any time in Settings.</p>
+      <div class="grid g2">
+        <div class="full">${f('name', 'Organisation / business name', 'maxlength="160" placeholder="Acme Services Pvt Ltd"')}</div>
+        ${f('gst_number', 'GSTIN', 'maxlength="15" placeholder="06AABCA1234F1Z5"')}${f('pan_number', 'PAN', 'maxlength="10" placeholder="AABCA1234F"')}
+        ${f('email', 'Billing email', 'type="email" placeholder="billing@company.com"')}${f('contact', 'Phone', 'inputmode="tel" placeholder="+91 98765 43210"')}
+        <div class="field full"><label for="o_address">Address</label><textarea id="o_address" name="address" rows="2">${esc(o.address || '')}</textarea></div>
+        <div class="field full"><label for="o_state">State</label><select id="o_state" name="state_code"><option value="">—</option>${STATE_OPTS().map((s) => `<option value="${s.v}" ${s.v === o.state_code ? 'selected' : ''}>${esc(s.l)}</option>`).join('')}</select></div>
+      </div>
+      <div class="ob-err hidden" role="alert"></div>
+      <div class="ob-actions"><button type="button" class="btn" id="skip">Skip for now</button><button class="btn primary">Save &amp; continue</button></div>
+    </form>`);
+  const form = $('#os');
+  gstHelper(form);
+  $('#skip').onclick = () => { sessionSet('onb', 'bank'); toast('Organisation details skipped — add them later in Settings'); renderBankStep(); };
+  form.onsubmit = submitter(form, async () => {
+    const body = Object.fromEntries(['name', 'gst_number', 'pan_number', 'email', 'contact', 'address', 'state_code'].map((k) => [k, form.elements[k].value.trim()]));
+    if (!body.name) throw new Error('Enter your organisation name, or skip this step');
+    if (body.gst_number && !gstInfo(body.gst_number).code) throw new Error('GSTIN should be 15 characters, like 06AABCA1234F1Z5');
+    if (body.email && !EMAIL_RE.test(body.email)) throw new Error('Enter a valid billing email');
+    await api('/organisations/' + o.id, { method: 'PUT', body });
+    S.meta.organisations = await api('/organisations');
+    sessionSet('onb', 'bank');
+    renderBankStep();
+  });
+}
+
+// Shared bank form (signup step 3 and Settings / dashboard later)
+function bankFields(b = {}) {
+  const f = (k, l, extra = '') => `<div class="field"><label for="b_${k}">${l}</label><input id="b_${k}" name="${k}" value="${esc(b[k] || '')}" ${extra}></div>`;
+  return `<div class="grid g2">${f('account_name', 'Account holder name', 'maxlength="120" autocomplete="off"')}${f('bank_name', 'Bank name', 'maxlength="120" placeholder="HDFC Bank"')}
+    ${f('account_number', 'Account number', `inputmode="numeric" maxlength="18" autocomplete="off" placeholder="${b.account_masked ? esc(b.account_masked) + ' (leave blank to keep)' : '6–18 digits'}"`)}${f('ifsc', 'IFSC code', 'maxlength="11" placeholder="HDFC0001234" style="text-transform:uppercase"')}
+    ${f('branch', 'Branch (optional)', 'maxlength="120"')}${f('upi_id', 'UPI ID (optional)', 'maxlength="100" placeholder="yourname@bank"')}</div>`;
+}
+function readBank(form, hasSaved) {
+  const v = Object.fromEntries(['account_name', 'bank_name', 'account_number', 'ifsc', 'branch', 'upi_id'].map((k) => [k, form.elements[k].value.trim()]));
+  v.ifsc = v.ifsc.toUpperCase(); v.account_number = v.account_number.replace(/\s/g, '');
+  if (!v.account_name) throw new Error('Enter the account holder name');
+  if (!v.bank_name) throw new Error('Enter the bank name');
+  if (!(hasSaved && !v.account_number) && !/^\d{6,18}$/.test(v.account_number)) throw new Error('Account number should be 6–18 digits');
+  if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(v.ifsc)) throw new Error('IFSC code looks like HDFC0001234 (11 characters)');
+  if (v.upi_id && !/^[\w.-]{2,256}@[A-Za-z]\w{1,63}$/.test(v.upi_id)) throw new Error('UPI ID looks like yourname@bank');
+  return v;
+}
+
+async function renderBankStep() {
+  const o = primaryOrg();
+  const saved = await api(`/organisations/${o.id}/bank`).catch(() => ({}));
+  authShell(`<form class="auth-card wide" id="bs" novalidate>${steps(3)}
+      <h1>Bank Details</h1><p class="lead">Printed on invoices so clients can pay you. Optional — you can add these later.</p>
+      ${bankFields(saved)}
+      <div class="ob-err hidden" role="alert"></div>
+      <div class="ob-actions"><button type="button" class="btn" id="skip">Skip for now</button><button class="btn primary">Save &amp; continue</button></div>
+    </form>`);
+  const form = $('#bs');
+  $('#skip').onclick = () => { sessionSet('onb', 'code'); toast('Bank details skipped — add them later in Settings'); showInviteCode(); };
+  form.onsubmit = submitter(form, async () => {
+    await api(`/organisations/${o.id}/bank`, { method: 'PUT', body: readBank(form, !!saved.account_masked) });
+    S.meta.organisations = await api('/organisations');
+    sessionSet('onb', 'code');
+    showInviteCode();
+  });
+}
+
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); }
+  catch { const t = Object.assign(document.createElement('textarea'), { value: text }); document.body.append(t); t.select(); document.execCommand('copy'); t.remove(); }
+  if (btn) { const h = btn.innerHTML; btn.innerHTML = `${ic('check', 16)} Copied`; btn.classList.add('ok'); setTimeout(() => { if (btn.isConnected) { btn.innerHTML = h; btn.classList.remove('ok'); } }, 1800); }
+  toast('Code copied');
+}
+const codeBox = (code) => `<div class="ob-code"><code id="ivc">${esc(code)}</code><button type="button" class="btn sm" data-copy>${ic('copy', 16)} Copy code</button></div>`;
+
+async function showInviteCode() {
+  const t = await api('/organisation');
+  authShell(`<div class="auth-card">${steps(4)}<h1>You're all set</h1><p class="lead">${esc(t.name)} is ready.</p></div>`);
+  const finish = () => { sessionSet('onb', null); location.hash = '#/dashboard'; boot(); };
+  const m = modal(`<div class="ob-done"><span class="ob-badge">${ic('check', 26)}</span><h2>Organisation created</h2>
+      <p class="muted">Share this code with your team. They can use it to request to join <b>${esc(t.name)}</b>, and you approve each request from your dashboard.</p>
+      ${codeBox(t.invite_code)}
+      ${!t.setup.details || !t.setup.bank ? `<p class="small muted">You skipped ${[!t.setup.details && 'organisation details', !t.setup.bank && 'bank details'].filter(Boolean).join(' and ')}. You can add them from the dashboard or Settings.</p>` : ''}
+      <button class="btn primary" id="cont">Continue to dashboard</button></div>`, { onClose: finish });
+  $('[data-copy]', m.el).onclick = (e) => copyText(t.invite_code, e.currentTarget);
+  $('#cont', m.el).onclick = () => m.close();
+}
+
+function renderJoin() {
+  let confirmed = null; // organisation name once the code has been checked
+  authShell(`<form class="auth-card" id="jf" novalidate>
+      <h1>Join an organisation</h1><p class="lead">Sign in with your account, or choose a password to create one.</p>
+      <div class="stack">
+        ${emailField()}
+        ${pwField('pw', 'Password', 'current-password', 'Your password (new accounts: 8+ chars, with a number)')}
+        <div class="field"><label for="cd">Organisation code</label><div class="inwrap">${ic('link', 18)}<input id="cd" placeholder="ABCDE-23456" maxlength="11" autocomplete="off" autocapitalize="characters" spellcheck="false" required></div></div>
+        <div class="ob-confirm hidden" id="oc"></div>
+        <div class="ob-err hidden" role="alert"></div>
+        <button class="btn primary" id="jb">Find organisation</button>
+        <p class="ob-alt"><a href="#" data-go="signup">← Back</a> · Have an account? <a href="#" data-go="login">Sign in</a></p>
+      </div></form>`);
+  const form = $('#jf');
+  $('#cd').oninput = () => { if (confirmed) { confirmed = null; $('#oc').classList.add('hidden'); $('#jb').textContent = 'Find organisation'; } };
+  form.onsubmit = submitter(form, async () => {
+    const email = $('#em').value.trim(), pw = $('#pw').value, code = $('#cd').value.trim();
+    if (!EMAIL_RE.test(email)) throw new Error('Enter a valid email address');
+    if (!pw) throw new Error('Enter your password');
+    if (!code) throw new Error('Enter the organisation code');
+    if (!confirmed) {
+      confirmed = (await api('/join/lookup', { method: 'POST', body: { code } })).organisation;
+      $('#oc').innerHTML = `<span>${ic('users', 18)}</span><div>You're asking to join <b>${esc(confirmed)}</b>. An admin will review your request.</div>`;
+      $('#oc').classList.remove('hidden');
+      setTimeout(() => { const b = $('#jb'); if (b) b.textContent = 'Send join request'; }, 0);
+      return;
+    }
+    const r = await api('/join', { method: 'POST', body: { email, password: pw, code } });
+    await signInAs(r.token);
+    boot();
+  });
+}
+
+// Signed in, but not (yet) an approved member: waiting / declined / no organisation.
+let pollTimer;
+function renderMembership() {
+  clearTimeout(pollTimer);
+  const m = S.user.membership, st = m?.status;
+  const who = `<p class="small muted ob-who">Signed in as ${esc(S.user.email)} · <a href="#" id="so2">Sign out</a></p>`;
+  if (st === 'pending') {
+    authShell(`<div class="auth-card ob-wait"><span class="ob-badge wait">${ic('clock', 26)}</span>
+        <h1>Request sent</h1><p class="lead">Your request to join <b>${esc(m.organisation)}</b> has been submitted. Waiting for admin approval.</p>
+        <div class="ob-live"><i></i>We'll take you in automatically once you're approved. You can also close this page and sign in later.</div>
+        <div class="stack"><button class="btn" id="ck">Check now</button><button class="btn" id="cx">Cancel request</button></div>${who}</div>`);
+    const check = async (manual) => {
+      try {
+        S.user = (await api('/me')).user;
+        if (S.user.membership?.status === 'approved') { toast(`Welcome to ${S.user.membership.organisation}!`); location.hash = '#/dashboard'; return boot(); }
+        if (S.user.membership?.status !== 'pending') return renderMembership();
+        if (manual) toast('Still waiting for approval');
+      } catch (e) { if (manual) toast(e.message, true); }
+      if ($('.ob-wait')) pollTimer = setTimeout(() => check(false), 5000);
+    };
+    pollTimer = setTimeout(() => check(false), 5000);
+    $('#ck').onclick = () => { clearTimeout(pollTimer); check(true); };
+    $('#cx').onclick = guard(async () => {
+      if (!(await confirmBox('Cancel your request to join this organisation?'))) return;
+      await api('/membership/cancel', { method: 'POST' }); S.user.membership = null; renderMembership();
+    });
+  } else {
+    const declined = st === 'rejected';
+    authShell(`<form class="auth-card" id="mf" novalidate>
+        ${declined ? `<span class="ob-badge bad">${ic('x', 26)}</span><h1>Request declined</h1><p class="lead">${esc(m.organisation)} didn't approve your request. You can join a different organisation or create your own.</p>`
+          : '<h1>Choose an organisation</h1><p class="lead">Your account isn\'t part of an organisation yet.</p>'}
+        <div class="stack">
+          <div class="field"><label for="cd">Organisation code</label><div class="inwrap">${ic('link', 18)}<input id="cd" placeholder="ABCDE-23456" maxlength="11" autocomplete="off" spellcheck="false"></div></div>
+          <div class="ob-err hidden" role="alert"></div>
+          <button class="btn primary">Request to join</button>
+          <button type="button" class="btn" id="mk">Create my own organisation</button>
+        </div>${who}</form>`);
+    const form = $('#mf');
+    form.onsubmit = submitter(form, async () => {
+      const code = $('#cd').value.trim();
+      if (!code) throw new Error('Enter the organisation code');
+      const { organisation } = await api('/join/lookup', { method: 'POST', body: { code } });
+      if (!(await confirmBox(`Send a request to join ${organisation}?`))) return;
+      await api('/membership/request', { method: 'POST', body: { code } });
+      boot();
+    });
+    $('#mk').onclick = guard(async () => {
+      await api('/onboarding/organisation', { method: 'POST' });
+      S.user = (await api('/me')).user; S.meta = null;
+      sessionSet('onb', 'org'); resumeSetup();
+    });
+  }
+  $('#so2').onclick = (e) => { e.preventDefault(); clearTimeout(pollTimer); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
+}
+
+// Dashboard: pending membership requests + unfinished setup (admins only)
+async function adminPanel(box) {
+  const [reqs, t, roles] = await Promise.all([api('/members/requests'), api('/organisation'), api('/roles')]).catch((e) => { box.innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return []; });
+  if (!t) return;
+  const opts = roles.map((r) => `<option value="${r.id}" ${r.name === 'Team member' ? 'selected' : ''}>${esc(r.name)}</option>`).join('');
+  const todo = [!t.setup.details && `<button class="btn sm" data-fix="org">${ic('edit', 15)} Add organisation details</button>`, !t.setup.bank && `<button class="btn sm" data-fix="bank">${ic('wallet', 15)} Add bank details</button>`].filter(Boolean);
+  box.innerHTML = `${todo.length ? `<section class="card ob-setup"><div><h2>Finish setting up</h2><p class="small muted">These were skipped during signup. They appear on your invoices.</p></div><div class="row">${todo.join('')}</div></section>` : ''}
+    <section class="card req-card"><div class="row sp"><h2>Pending requests${reqs.length ? ` <span class="badge">${reqs.length}</span>` : ''}</h2>
+      <button class="btn sm" data-showcode>${ic('link', 15)} Invite code</button></div>
+      ${reqs.length ? `<div class="mrows">${reqs.map((r) => `<div class="mr-i req" data-r="${r.id}">${avatar(r.name, 'sm')}<div class="mid"><div class="t">${esc(r.name)}</div><div class="s">${esc(r.email)} · requested ${fmtLong(r.created_at)}</div></div>
+          <div class="end req-acts"><select aria-label="User type for ${esc(r.name)}">${opts}</select><button class="btn sm danger" data-rej>Reject</button><button class="btn sm primary" data-ok>Approve</button></div></div>`).join('')}</div>`
+        : '<div class="empty">No pending requests. Share your invite code so teammates can ask to join.</div>'}</section>`;
+  const act = (b, kind) => guard(async () => {
+    const row = b.closest('[data-r]'), name = $('.t', row).textContent;
+    if (kind === 'reject' && !(await confirmBox(`Reject ${name}'s request?`))) return;
+    $$('button', row).forEach((x) => (x.disabled = true));
+    try {
+      await api(`/members/requests/${row.dataset.r}/${kind}`, { method: 'POST', body: kind === 'approve' ? { role_id: +$('select', row).value } : {} });
+      toast(kind === 'approve' ? `${name} can now access the organisation` : 'Request rejected');
+    } finally { adminPanel(box); }
+  });
+  $$('[data-ok]', box).forEach((b) => (b.onclick = act(b, 'approve')));
+  $$('[data-rej]', box).forEach((b) => (b.onclick = act(b, 'reject')));
+  $('[data-showcode]', box).onclick = () => { const m = modal(`<h2>Invite code</h2><p class="muted">People can use this code to request to join ${esc(t.name)}.</p>${codeBox(t.invite_code)}<div class="actions"><button class="btn" data-x>Close</button></div>`); $('[data-copy]', m.el).onclick = (e) => copyText(t.invite_code, e.currentTarget); $('[data-x]', m.el).onclick = m.close; };
+  const fix = $('[data-fix=org]', box), fixB = $('[data-fix=bank]', box), org = primaryOrg();
+  if (fix) fix.onclick = () => crudForm(CFG.organisations, org, () => adminPanel(box));
+  if (fixB) fixB.onclick = () => bankModal(org, () => adminPanel(box));
+}
+async function bankModal(org, done) {
+  const saved = await api(`/organisations/${org.id}/bank`);
+  const m = modal(`<h2>Bank details · ${esc(org.name)}</h2><form novalidate>${bankFields(saved)}<div class="ob-err hidden" role="alert"></div><div class="actions"><button type="button" class="btn" data-x>Cancel</button><button class="btn primary">Save</button></div></form>`);
+  const form = $('form', m.el);
+  $('[data-x]', m.el).onclick = m.close;
+  form.onsubmit = submitter(form, async () => {
+    await api(`/organisations/${org.id}/bank`, { method: 'PUT', body: readBank(form, !!saved.account_masked) });
+    S.meta.organisations = await api('/organisations');
+    m.close(); toast('Bank details saved'); done && done();
+  });
+}
+async function inviteCard(box) {
+  const t = await api('/organisation');
+  box.innerHTML = `<div class="card"><h2>Organisation invite code</h2><p class="small muted">Anyone with this code can <b>request</b> to join ${esc(t.name)} — you approve each request on the dashboard. Regenerate it to stop the old code working.</p>
+    ${codeBox(t.invite_code)}<div class="row" style="margin-top:10px"><button class="btn sm" id="rg">Regenerate code</button>${primaryOrg() ? `<button class="btn sm" id="bk">${ic('wallet', 15)} Bank details</button>` : ''}</div></div>`;
+  $('[data-copy]', box).onclick = (e) => copyText(t.invite_code, e.currentTarget);
+  $('#rg', box).onclick = guard(async () => { if (!(await confirmBox('Make a new code? The current code will stop working.'))) return; await api('/organisation/invite-code', { method: 'POST' }); toast('New code created'); inviteCard(box); });
+  if ($('#bk', box)) $('#bk', box).onclick = () => bankModal(primaryOrg(), () => viewSettings($('#view')));
+}
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('/sw.js').catch(() => {});
 const pubMatch = location.pathname.match(/^\/p\/([\w-]+)/);

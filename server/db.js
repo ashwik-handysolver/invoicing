@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const file = process.env.DB_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'invoice.db');
 export const db = new DatabaseSync(file);
@@ -10,27 +11,62 @@ const clean = (p) => p.map((x) => (x === undefined ? null : typeof x === 'boolea
 export const all = (sql, ...p) => db.prepare(sql).all(...clean(p));
 export const get = (sql, ...p) => db.prepare(sql).get(...clean(p));
 export const run = (sql, ...p) => db.prepare(sql).run(...clean(p));
+let txDepth = 0; // nested tx() calls join the outer transaction
 export function tx(fn) {
+  if (txDepth) return fn();
   db.exec('BEGIN');
+  txDepth++;
   try { const r = fn(); db.exec('COMMIT'); return r; }
   catch (e) { db.exec('ROLLBACK'); throw e; }
+  finally { txDepth--; }
 }
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS roles (
+const cols = (t) => all(`PRAGMA table_info(${t})`).map((x) => x.name);
+const legacy = cols('roles').length > 0 && !cols('roles').includes('tenant_id'); // single-company DB from before organisation signup
+
+// Tenant = the organisation people sign up for / join. Its billing entities (GSTIN, bank…) live in `organisations`.
+const ROLES_SQL = `CREATE TABLE IF NOT EXISTS roles (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
-  permissions TEXT NOT NULL DEFAULT '[]'
-);
-CREATE TABLE IF NOT EXISTS users (
+  tenant_id INTEGER REFERENCES tenants(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  permissions TEXT NOT NULL DEFAULT '[]',
+  UNIQUE (tenant_id, name)
+)`;
+// role_id stays NULL until the user is an approved member of an organisation
+const USERS_SQL = `CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
-  role_id INTEGER NOT NULL REFERENCES roles(id),
+  role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`;
+const SETTINGS_SQL = 'CREATE TABLE IF NOT EXISTS settings (tenant_id INTEGER NOT NULL DEFAULT 0, key TEXT NOT NULL, value TEXT, PRIMARY KEY (tenant_id, key))';
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS tenants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  invite_code TEXT NOT NULL UNIQUE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS memberships (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  decided_at TEXT, decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  UNIQUE (tenant_id, user_id)
+);
+-- a user belongs to (or is waiting for) at most one organisation at a time
+CREATE UNIQUE INDEX IF NOT EXISTS idx_member_active ON memberships(user_id) WHERE status IN ('pending','approved');
+CREATE INDEX IF NOT EXISTS idx_member_tenant ON memberships(tenant_id, status);
+${ROLES_SQL};
+${USERS_SQL};
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -146,7 +182,6 @@ if (!get("SELECT sql FROM sqlite_master WHERE name = 'message_templates'").sql.i
 }
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS recurring_invoices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP, created_by INTEGER,
@@ -177,8 +212,10 @@ CREATE TABLE IF NOT EXISTS activity_log (
 );
 CREATE INDEX IF NOT EXISTS idx_act_created ON activity_log(created_at);
 `);
-export const getSetting = (k, dflt) => { const r = get('SELECT value FROM settings WHERE key = ?', k); return r ? JSON.parse(r.value) : dflt; };
-export const setSetting = (k, v) => run('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, JSON.stringify(v));
+if (!cols('settings').length) db.exec(SETTINGS_SQL);
+// tenant 0 holds install-wide flags
+export const getSetting = (k, dflt, tid = 0) => { const r = get('SELECT value FROM settings WHERE tenant_id = ? AND key = ?', tid, k); return r ? JSON.parse(r.value) : dflt; };
+export const setSetting = (k, v, tid = 0) => run('INSERT INTO settings (tenant_id, key, value) VALUES (?, ?, ?) ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value', tid, k, JSON.stringify(v));
 
 addCol('invoices', 'gst_applied', 'INTEGER DEFAULT 1');
 addCol('invoices', 'pay_qr', 'INTEGER DEFAULT 1');
@@ -189,3 +226,53 @@ addCol('recurring_invoices', 'gst_applied', 'INTEGER DEFAULT 1');
 addCol('recurring_invoices', 'pay_qr', 'INTEGER DEFAULT 1');
 addCol('recurring_invoices', 'pay_upi', 'INTEGER DEFAULT 1');
 addCol('recurring_invoices', 'pay_bank', 'INTEGER DEFAULT 1');
+
+/* ---- v3: organisation signup (multi-tenant) ---- */
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+export const normCode = (c) => {
+  const x = String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return x.length === 10 ? `${x.slice(0, 5)}-${x.slice(5)}` : null;
+};
+export function newInviteCode() {
+  for (;;) {
+    const code = normCode(Array.from({ length: 10 }, () => CODE_CHARS[crypto.randomInt(CODE_CHARS.length)]).join(''));
+    if (!get('SELECT 1 AS x FROM tenants WHERE invite_code = ?', code)) return code;
+  }
+}
+
+// Every organisation-owned table carries tenant_id; child rows (items, payments) are reached through their invoice.
+const TENANT_TABLES = ['organisations', 'clients', 'service_products', 'invoices', 'message_templates', 'reminder_log', 'email_notify',
+  'recurring_invoices', 'credit_notes', 'expenses', 'activity_log'];
+for (const t of TENANT_TABLES) {
+  addCol(t, 'tenant_id', 'INTEGER REFERENCES tenants(id) ON DELETE CASCADE');
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_${t}_tenant ON ${t}(tenant_id)`);
+}
+
+if (legacy) {
+  // Existing single-company data becomes organisation #1; everyone already there stays an approved member.
+  db.exec('PRAGMA foreign_keys = OFF');
+  tx(() => {
+    const first = get('SELECT name FROM organisations ORDER BY id LIMIT 1');
+    const tid = run('INSERT INTO tenants (name, invite_code) VALUES (?, ?)', first?.name || 'My organisation', newInviteCode()).lastInsertRowid;
+    db.exec(`${ROLES_SQL.replace('IF NOT EXISTS roles', 'roles_new')};
+      INSERT INTO roles_new (id, tenant_id, name, permissions) SELECT id, ${tid}, name, permissions FROM roles;
+      DROP TABLE roles; ALTER TABLE roles_new RENAME TO roles;
+      ${USERS_SQL.replace('IF NOT EXISTS users', 'users_new')};
+      INSERT INTO users_new SELECT id, name, email, password_hash, role_id, active, created_at FROM users;
+      DROP TABLE users; ALTER TABLE users_new RENAME TO users;
+      ALTER TABLE settings RENAME TO settings_old; ${SETTINGS_SQL};
+      INSERT INTO settings (tenant_id, key, value) SELECT ${tid}, key, value FROM settings_old WHERE key != 'perms_v2';
+      INSERT INTO settings (tenant_id, key, value) SELECT 0, key, value FROM settings_old WHERE key = 'perms_v2';
+      DROP TABLE settings_old;`);
+    for (const t of TENANT_TABLES) run(`UPDATE ${t} SET tenant_id = ? WHERE tenant_id IS NULL`, tid);
+    run(`INSERT INTO memberships (tenant_id, user_id, role, status, decided_at)
+         SELECT ?, u.id, CASE WHEN r.permissions LIKE '%"*"%' THEN 'admin' ELSE 'member' END, 'approved', CURRENT_TIMESTAMP
+         FROM users u JOIN roles r ON r.id = u.role_id`, tid);
+    run("UPDATE tenants SET created_by = (SELECT MIN(user_id) FROM memberships WHERE tenant_id = ? AND role = 'admin') WHERE id = ?", tid, tid);
+  });
+  db.exec('PRAGMA foreign_keys = ON');
+}
+
+// Platform "management" accounts see every organisation's summary (no organisation membership needed)
+addCol('users', 'is_management', 'INTEGER NOT NULL DEFAULT 0');
+addCol('clients', 'status', "TEXT NOT NULL DEFAULT 'active'"); // active | inactive | on_hold
