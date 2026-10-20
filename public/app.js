@@ -21,6 +21,7 @@ const themeIcon = () => ic(document.documentElement.dataset.theme === 'dark' ? '
 const mobile = () => matchMedia('(max-width: 760px)').matches;
 const initials = (n) => (String(n || '?').replace(/[^A-Za-z0-9 ]/g, ' ').trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join('') || '?').toUpperCase();
 const hue = (n) => { let h = 0; for (const c of String(n)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
+const youChip = (label = 'You') => `<span class="av xs you" title="You">${esc(initials(S.user.name))}</span><span class="tyou">${label}</span>`;
 const avatar = (n, cls = '') => `<div class="av ${cls}" style="--h:${hue(n)}">${esc(initials(n))}</div>`;
 function toggleTheme() {
   const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
@@ -186,42 +187,144 @@ const NAV = [
   { id: 'invoices', label: 'Invoices', icon: 'file', perm: 'invoices.view', hash: '#/invoices', grp: 'Sales' },
   { id: 'payments', label: 'Payments', icon: 'rupee', perm: 'invoices.view', hash: '#/payments', grp: 'Sales' },
   { id: 'recurring', label: 'Recurring', icon: 'repeat', perm: 'recurring.view', hash: '#/recurring', grp: 'Sales' },
-  { id: 'reminders', label: 'Reminders', icon: 'bell', perm: 'reminders.view', hash: '#/reminders', badge: true, grp: 'Sales' },
+  { id: 'reminders', label: 'Reminders', icon: 'bell', perm: 'reminders.view', hash: '#/reminders', badge: true, grp: 'Sales', inHeader: true },
   { id: 'expenses', label: 'Expenses', icon: 'wallet', perm: 'expenses.view', hash: '#/expenses', grp: 'Money' },
   { id: 'gst', label: 'GST report', icon: 'percent', perm: 'gst.view', hash: '#/gst', grp: 'Reports' },
-  { id: 'activity', label: 'Activity log', icon: 'clock', perm: 'activity.view', hash: '#/activity', grp: 'Reports' },
+  { id: 'activity', label: 'Activity log', icon: 'clock', perm: 'activity.view', hash: '#/activity', grp: 'Reports', inSettings: true },
   { id: 'clients', label: 'Clients', icon: 'users', perm: 'clients.view', hash: '#/clients', grp: 'Setup' },
   { id: 'products', label: 'Services', icon: 'box', perm: 'products.view', hash: '#/products', grp: 'Setup' },
-  { id: 'templates', label: 'Templates', icon: 'chat', perm: 'templates.view', hash: '#/templates', grp: 'Setup' },
-  { id: 'users', label: 'Users', icon: 'user', perm: 'users.view', hash: '#/users', grp: 'Admin' },
-  { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', hash: '#/settings', grp: 'Admin' },
-  { id: 'management', label: 'Management', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management' },
+  { id: 'templates', label: 'Templates', icon: 'chat', perm: 'templates.view', hash: '#/templates', grp: 'Setup', inSettings: true },
+  { id: 'users', label: 'Users', icon: 'user', perm: 'users.view', hash: '#/users', grp: 'Admin', inSettings: true },
+  { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', anyPerm: ['settings.view', 'users.view', 'templates.view', 'activity.view'], hash: '#/settings', grp: 'Admin', inSettings: true },
+  { id: 'tasks', label: 'Tasks', icon: 'check', perm: 'tasks.view', hash: '#/tasks', grp: 'Tasks', sec: 'tasks' },
+  { id: 'management', label: 'Dashboard', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management', sec: 'top' },
+  { id: 'organisations', label: 'Organisations', icon: 'users', perm: 'management.view', hash: '#/organisations', grp: 'Management', sec: 'top' },
 ];
-async function refreshBadge() {
-  try { S.badge = (await api('/reminders/summary')).queue_count || 0; } catch { S.badge = 0; }
-  $$('[data-badge]').forEach((b) => { b.textContent = S.badge; b.classList.toggle('hidden', !S.badge); });
-}
 function renderShell() {
-  const items = NAV.filter((n) => (n.perm ? can(n.perm) : !!S.user.membership && S.user.membership.status === 'approved'));
+  const items = NAV.filter((n) => !n.inSettings && !n.inHeader &&(n.anyPerm ? n.anyPerm.some(can) : n.perm ? can(n.perm) : !!S.user.membership && S.user.membership.status === 'approved'));
+  const settingsOk = ['settings.view', 'users.view', 'templates.view', 'activity.view'].some(can);
+  // sidebar sections, each a collapsible dropdown (open state remembered per section)
+  const SECS = [{ id: 'invoicing', l: 'Invoicing', icon: 'file' }, { id: 'tasks', l: 'Task management', icon: 'clipboard' }];
+  const isOpen = (id) => { try { return localStorage.getItem('nav:' + id) !== '0'; } catch { return true; } };
   const link = (n, cls) => `<a class="${cls}" data-nav="${n.id}" href="${n.hash}"><span class="ico">${ic(n.icon)}</span><span class="lb">${n.label}</span>${n.badge ? '<span class="badge hidden" data-badge></span>' : ''}</a>`;
   const bottom = ['dashboard', 'invoices', 'payments'] /* + centre mic + More (Reminders etc. are in More) */.map((id) => items.find((n) => n.id === id)).filter(Boolean);
   $('#app').innerHTML = `<div class="shell">
     <aside class="side"><div class="brand">${LOGO} Invoice Manager</div>
       ${S.user.membership?.status === 'approved' ? `<button type="button" class="side-mic" data-mic aria-label="Voice"><span>${ic('mic', 22, 2.6)}</span>Voice</button>` : ''}
-      ${items.map((n, i) => (i && items[i - 1].grp === n.grp ? '' : `<div class="navgrp">${n.grp}</div>`) + link(n, 'nav')).join('')}<div class="grow"></div>
-      <div class="userchip">${avatar(S.user.name, 'sm')}<div style="flex:1;min-width:0"><div style="font-weight:600;font-size:13.5px">${esc(S.user.name)}</div><div class="small muted">${esc(S.user.role)}</div></div>
-        <button class="ibtn" id="so" aria-label="Sign out" title="Sign out">${ic('logout', 18)}</button></div></aside>
+      ${items.filter((n) => n.sec === 'top').map((n) => link(n, 'nav')).join('')}
+      ${SECS.map((sec) => { const its = items.filter((n) => (n.sec || 'invoicing') === sec.id); if (!its.length) return ''; const o = isOpen(sec.id);
+        return `<div class="navdd ${o ? 'open' : ''}" data-sec="${sec.id}"><button type="button" class="navdd-h" aria-expanded="${o}"><span class="ico">${ic(sec.icon)}</span><span class="lb">${sec.l}</span><span class="chev">${ic('chevron', 16)}</span></button>
+        <div class="navdd-b"><div class="navdd-in">${its.map((n, i) => (sec.id !== 'invoicing' || (i && its[i - 1].grp === n.grp) ? '' : `<div class="navgrp">${n.grp}</div>`) + link(n, 'nav')).join('')}</div></div></div>`; }).join('')}<div class="grow"></div></aside>
     <div class="main"><header class="top"><div class="title" id="pt"></div>
-      <button class="searchpill" id="gs" aria-label="Search">${ic('search', 17)}<span>Search invoices, clients…</span><kbd>Ctrl K</kbd></button>
+      ${S.user.membership?.status === 'approved' ? `<button class="searchpill" id="gs" aria-label="Search">${ic('search', 17)}<span>Search invoices, clients…</span><kbd>Ctrl K</kbd></button>` : '<span class="grow"></span>'}
+      ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new?type=tax">${ic('plus')} Invoice</a>` : ''}
+      ${Object.values(bellSources()).some(Boolean) ? `<div class="usermenu" id="bm"><button type="button" class="ibtn bellbtn" aria-haspopup="menu" aria-expanded="false" aria-label="Notifications" title="Notifications">${ic('bell', 18)}<span class="badge hidden" data-badge></span></button>
+        <div class="um-pop notif-pop" role="menu"><div class="um-who"><b>Notifications</b></div><div class="notif-list"></div>${can('reminders.view') ? '<a class="notif-all" href="#/reminders">View all reminders</a>' : ''}</div></div>` : ''}
       <button class="ibtn" data-theme-btn aria-label="Toggle light / dark theme">${themeIcon()}</button>
-      ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new?type=tax">${ic('plus')} Invoice</a>` : ''}</header>
+      <div class="usermenu" id="um"><button type="button" class="um-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Account">${avatar(S.user.name, 'sm')}</button>
+        <div class="um-pop" role="menu"><div class="um-who"><b>${esc(S.user.name)}</b><small class="muted">${esc(S.user.role)}${S.user.membership?.organisation ? ` · ${esc(S.user.membership.organisation)}` : ''}</small></div>
+          <button type="button" role="menuitem" id="acct">${ic('user', 17)} My account</button>${settingsOk ? `<a role="menuitem" href="#/settings">${ic('gear', 17)} Settings</a>` : ''}<button type="button" role="menuitem" class="um-logout" id="so">${ic('logout', 17)} Log out</button></div></div></header>
       <main class="content" id="view"></main></div>
     <nav class="bottom">${bottom.slice(0, 2).map((n) => link(n, '')).join('')}${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}${bottom.slice(2).map((n) => link(n, '')).join('')}<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a></nav>
     ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new?type=tax" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
+  $('#acct').onclick = () => { umSet(false); openAccount(); };
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
   $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
-  $('#gs').onclick = openSearch;
+  if ($('#gs')) $('#gs').onclick = openSearch;
+  const um = $('#um'), umb = $('.um-btn', um), umSet = (o) => { um.classList.toggle('open', o); umb.setAttribute('aria-expanded', o); };
+  umb.onclick = (e) => { e.stopPropagation(); umSet(!um.classList.contains('open')); };
+  $('.um-pop', um).onclick = (e) => { if (e.target.closest('a')) umSet(false); };
+  document.addEventListener('click', (e) => { if (!um.contains(e.target)) umSet(false); });
+  const bm = $('#bm');
+  if (bm) {
+    const bb = $('.bellbtn', bm), bSet = (o) => { bm.classList.toggle('open', o); bb.setAttribute('aria-expanded', o); };
+    bb.onclick = (e) => { e.stopPropagation(); const o = !bm.classList.contains('open'); bSet(o); if (o) loadNotifs($('.notif-list', bm)); };
+    $('.notif-pop', bm).onclick = (e) => { if (e.target.closest('a')) bSet(false); };
+    document.addEventListener('click', (e) => { if (!bm.contains(e.target)) bSet(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') bSet(false); });
+  }
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') umSet(false); });
+  $$('.navdd').forEach((dd) => ($('.navdd-h', dd).onclick = (e) => { const o = dd.classList.toggle('open'); e.currentTarget.setAttribute('aria-expanded', o); try { localStorage.setItem('nav:' + dd.dataset.sec, o ? '1' : '0'); } catch {} }));
   refreshBadge();
+}
+// Bell: one list for everyone: payment reminders (overdue / send today), your tasks due today or overdue,
+// and for management the platform events too. Each source is included only when the user can see it.
+const bellSources = () => ({ pay: can('reminders.view'), tasks: can('tasks.view'), platform: !!S.user.isManagement });
+const PSEEN = 'platformSeen';
+const pSeen = () => { try { return localStorage.getItem(PSEEN) || ''; } catch { return ''; } };
+async function bellData() {
+  const src = bellSources(), t0 = todayStr();
+  const [pay, tasks, platform] = await Promise.all([
+    src.pay ? api('/reminders/queue').catch(() => []) : [],
+    src.tasks ? api('/tasks').then((l) => l.filter((t) => t.assignees.some((a) => a.id === S.user.id) && t.status !== 'done' && t.due_date && t.due_date <= t0)).catch(() => []) : [],
+    src.platform ? api('/management/notifications').catch(() => []) : [],
+  ]);
+  return { pay, tasks, platform, t0 };
+}
+async function refreshBadge() {
+  if (!$('#bm')) return;
+  const d = await bellData(), seen = pSeen();
+  const n = d.pay.length + d.tasks.length + d.platform.filter((x) => x.at > seen).length;
+  $$('[data-badge]').forEach((b) => { b.textContent = n > 9 ? '9+' : n; b.classList.toggle('hidden', !n); });
+}
+async function loadNotifs(el) {
+  el.innerHTML = '<div class="empty small">Loading…</div>';
+  const d = await bellData(), seen = pSeen(), out = [];
+  const payRow = (r) => `<a class="notif" href="#/invoices/${r.id}"><div><b>${esc(r.client_name)}</b><small class="muted">${esc(r.invoice_number)} · ${money(r.balance_amount)}</small></div><span class="pill ${r.diff > 0 ? 'overdue' : 'partial'}">${esc(r.label)}</span></a>`;
+  const taskRow = (t) => `<a class="notif" href="#/tasks"><div><b>${esc(t.title)}</b><small class="muted">${t.assigned_by && t.assigned_by !== S.user.id ? `From ${esc(t.assigned_by_name || '')} · ` : ''}${t.priority} priority</small></div><span class="pill ${t.due_date < d.t0 ? 'overdue' : 'partial'}">${t.due_date < d.t0 ? `${Math.round((new Date(d.t0) - new Date(t.due_date)) / 864e5)}d overdue` : 'Due today'}</span></a>`;
+  const over = d.pay.filter((r) => r.diff > 0), today = d.pay.filter((r) => r.diff <= 0);
+  if (over.length) out.push(`<div class="navgrp">Overdue payments</div>${over.slice(0, 5).map(payRow).join('')}`);
+  if (today.length) out.push(`<div class="navgrp">Reminders to send today</div>${today.slice(0, 5).map(payRow).join('')}`);
+  if (d.tasks.length) out.push(`<div class="navgrp">Tasks due</div>${d.tasks.slice(0, 5).map(taskRow).join('')}`);
+  if (d.platform.length) {
+    const text = { org: (x) => `<b>${esc(x.org)}</b> started using the platform${x.person ? ` <span class="muted">(${esc(x.person)})</span>` : ''}`,
+      member: (x) => `<b>${esc(x.person)}</b> joined <b>${esc(x.org)}</b>`, request: (x) => `<b>${esc(x.person)}</b> requested to join <b>${esc(x.org)}</b>` };
+    const icn = { org: 'grid', member: 'user', request: 'clock' };
+    const when = (at) => { const dt = new Date(at.replace(' ', 'T') + 'Z'), m = Math.round((Date.now() - dt) / 6e4);
+      return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }); };
+    out.push(`<div class="navgrp">Platform</div>${d.platform.slice(0, 8).map((x) => `<a class="pnotif ${x.at > seen ? 'new' : ''}" href="#/organisations"><span class="pn-ic ${x.kind}">${ic(icn[x.kind], 15)}</span><span class="pn-t"><span>${text[x.kind](x)}</span><small class="muted">${when(x.at)}</small></span></a>`).join('')}`);
+    try { localStorage.setItem(PSEEN, d.platform[0].at); } catch {}
+  }
+  el.innerHTML = out.join('') || '<div class="empty small">All caught up.</div>';
+  const n = d.pay.length + d.tasks.length;
+  $$('[data-badge]').forEach((b) => { b.textContent = n > 9 ? '9+' : n; b.classList.toggle('hidden', !n); });
+}
+// Your own name, email and password (from the avatar menu). Saving needs the current password.
+function openAccount() {
+  const m = modal(`<h2>My account</h2><form class="grid g2" novalidate>
+    <div class="field full"><label for="ac-n">Name</label><input id="ac-n" name="name" value="${esc(S.user.name)}" required autocomplete="name"></div>
+    <div class="field full"><label for="ac-e">Email</label><input id="ac-e" name="email" type="email" value="${esc(S.user.email)}" required autocomplete="email"></div>
+    <div class="field"><label for="ac-p">New password</label><input id="ac-p" name="new_password" type="password" placeholder="Leave blank to keep" autocomplete="new-password"></div>
+    <div class="field"><label for="ac-p2">Confirm new password</label><input id="ac-p2" name="confirm" type="password" autocomplete="new-password"></div>
+    <div class="field full"><label for="ac-c">Current password</label><input id="ac-c" name="current_password" type="password" required autocomplete="current-password"></div>
+    <div class="ob-err hidden full" role="alert"></div>
+    <div class="actions full"><button type="button" class="btn" data-x>Cancel</button><button class="btn primary">Save changes</button></div></form>`);
+  const f = $('form', m.el), err = $('.ob-err', m.el);
+  $('[data-x]', m.el).onclick = m.close;
+  f.onsubmit = guard(async (e) => {
+    e.preventDefault();
+    const show = (msg) => { err.textContent = msg; err.classList.remove('hidden'); };
+    const v = Object.fromEntries(new FormData(f)), body = { current_password: v.current_password };
+    if (v.name.trim() !== S.user.name) body.name = v.name.trim();
+    if (v.email.trim().toLowerCase() !== S.user.email.toLowerCase()) body.email = v.email.trim();
+    if (v.new_password) {
+      const bad = pwProblem(v.new_password);
+      if (bad) return show(bad);
+      if (v.new_password !== v.confirm) return show('New passwords do not match');
+      body.new_password = v.new_password;
+    }
+    if (Object.keys(body).length === 1) return show('Nothing to change');
+    if (!body.name && !body.email && !body.new_password) return;
+    if (!v.current_password) return show('Enter your current password to save');
+    if (body.email && !EMAIL_RE.test(body.email)) return show('Enter a valid email address');
+    try {
+      const res = await api('/account', { method: 'PUT', body });
+      Object.assign(S.user, res.user);
+      m.close(); toast(body.new_password ? 'Account updated. Other devices were signed out.' : 'Account updated');
+      renderShell(); route();
+    } catch (x) { show(x.message); }
+  });
+  $('#ac-n', m.el).focus();
 }
 function openMore(items) {
   const m = modal(`<h2>Menu</h2><div class="moregrid">${items.map((n) => `<a class="moretile ${location.hash.startsWith(n.hash) ? 'on' : ''}" href="${n.hash}">${ic(n.icon)}<span>${n.label}</span>${n.badge && S.badge ? `<span class="badge">${S.badge}</span>` : ''}</a>`).join('')}</div>
@@ -241,12 +344,12 @@ async function boot() {
   } catch { return S.token ? renderOffline() : renderLogin(); }
   if (S.user.membership?.status !== 'approved') { // management account without an organisation
     renderShell();
-    if (!location.hash.startsWith('#/management')) location.hash = '#/management';
+    if (!/^#\/(management|organisations)/.test(location.hash)) location.hash = '#/management';
     return route();
   }
   if (sessionGet('onb')) return resumeSetup();
   renderShell();
-  if (!location.hash || location.hash === '#/') location.hash = can('dashboard.view') ? '#/dashboard' : '#/invoices';
+  if (!location.hash || location.hash === '#/') location.hash = S.user.isManagement ? '#/management' : can('dashboard.view') ? '#/dashboard' : can('invoices.view') ? '#/invoices' : can('tasks.view') ? '#/tasks' : '#/settings';
   route();
 }
 
@@ -261,14 +364,16 @@ const routes = [
   [/^#\/recurring$/, 'recurring', 'recurring.view', viewRecurring],
   [/^#\/expenses$/, 'expenses', 'expenses.view', (el) => crudView(el, CFG.expenses)],
   [/^#\/gst$/, 'gst', 'gst.view', viewGst],
-  [/^#\/activity$/, 'activity', 'activity.view', viewActivity],
+  [/^#\/activity$/, 'settings', 'activity.view', (el) => viewSettings(el, 'activity')],
   [/^#\/credit-notes\/(\d+)$/, 'invoices', 'invoices.view', (el, m) => viewCreditNote(el, m[1])],
   [/^#\/reminders$/, 'reminders', 'reminders.view', viewReminders],
   [/^#\/clients$/, 'clients', 'clients.view', (el) => crudView(el, CFG.clients)],
   [/^#\/products$/, 'products', 'products.view', (el) => crudView(el, CFG.products)],
-  [/^#\/templates$/, 'templates', 'templates.view', (el) => crudView(el, CFG.templates)],
-  [/^#\/users$/, 'users', 'users.view', (el) => crudView(el, CFG.users)],
-  [/^#\/settings$/, 'settings', 'settings.view', viewSettings],
+  [/^#\/templates$/, 'settings', 'templates.view', (el) => viewSettings(el, 'templates')],
+  [/^#\/users$/, 'settings', 'users.view', (el) => viewSettings(el, 'users')],
+  [/^#\/settings$/, 'settings', null, (el) => viewSettings(el)],
+  [/^#\/organisations$/, 'organisations', 'management.view', viewOrgControl],
+  [/^#\/tasks$/, 'tasks', 'tasks.view', viewTasks],
   [/^#\/management$/, 'management', 'management.view', viewManagement],
 ];
 async function route() {
@@ -284,6 +389,7 @@ async function route() {
     if (perm && !can(perm)) { view.innerHTML = '<div class="empty card">You don\'t have access to this page.</div>'; return; }
     $('#pt').textContent = /invoices\/new/.test(path) ? 'New invoice' : /invoices\/\d+\/edit/.test(path) ? 'Edit invoice' : /invoices\/\d+/.test(path) ? 'Invoice' : /credit-notes/.test(path) ? 'Credit note' : NAV.find((n) => n.id === nav)?.label || '';
     const fab = $('#fab'); if (fab) fab.classList.toggle('hidden', !['dashboard', 'invoices', 'payments', 'reminders'].includes(nav) || /new|edit|invoices\/\d/.test(path));
+    view.classList.remove('still'); // page change: let the fade-in run
     view.innerHTML = '<div class="empty">Loading…</div>';
     window.scrollTo(0, 0);
     try { await fn(view, m, q); } catch (e) { view.innerHTML = `<div class="empty card">${esc(e.message)}</div>`; }
@@ -1111,7 +1217,7 @@ const CFG = {
     defaults: { active: 1 },
   },
   organisations: {
-    title: 'Organisations (billing entities)', api: '/organisations', perm: 'settings', write: 'edit', noun: 'organisation', small: 1, onOpen: gstHelper,
+    title: 'Billing entities', api: '/organisations', perm: 'settings', write: 'edit', noun: 'billing entity', small: 1, onOpen: gstHelper,
     cols: [{ k: 'name', l: 'Name', first: true }, { k: 'gst_number', l: 'GSTIN' }, { k: 'contact', l: 'Contact' }],
     fields: [{ k: 'name', l: 'Name', req: 1, full: 1 }, { k: 'gst_number', l: 'GSTIN' }, { k: 'pan_number', l: 'PAN' }, { k: 'email', l: 'Email', t: 'email' }, { k: 'contact', l: 'Phone' },
       { k: 'address', l: 'Address', t: 'textarea', full: 1 }, { k: 'bank_details', l: 'Bank details (printed on invoice)', t: 'textarea', rows: 5, full: 1 },
@@ -1166,9 +1272,10 @@ async function crudForm(cfg, row, done, onCancel) {
   const vals = row || cfg.defaults || {};
   const fieldHtml = [];
   for (const f of cfg.fields) {
-    const v = f.noFill ? '' : vals[f.k] ?? '';
+    const v = f.noFill ? '' : f.val ? f.val(vals) : vals[f.k] ?? '';
     let input;
-    if (f.t === 'textarea') input = `<textarea name="${f.k}" rows="${f.rows || 3}" ${f.req ? 'required' : ''}>${esc(v)}</textarea>`;
+    if (f.t === 'multi') input = `<input type="hidden" name="${f.k}" value="${esc(JSON.stringify(v || []))}">`;
+    else if (f.t === 'textarea') input = `<textarea name="${f.k}" rows="${f.rows || 3}" ${f.req ? 'required' : ''}>${esc(v)}</textarea>`;
     else if (f.t === 'select') {
       const opts = typeof f.opts === 'function' ? await f.opts() : f.opts;
       input = `<select name="${f.k}" ${f.req ? 'required' : ''}>${f.blank ? '<option value="">—</option>' : ''}${opts.map((o) => `<option value="${esc(o.v)}" ${String(o.v) === String(v) ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}</select>`;
@@ -1178,7 +1285,7 @@ async function crudForm(cfg, row, done, onCancel) {
     fieldHtml.push(`<div class="field ${f.full ? 'full' : ''}"><label>${f.l}</label>${input}</div>`);
   }
   let saved = false;
-  const m = modal(`<h2>${row ? 'Edit' : 'Add'} ${cfg.noun}</h2><form class="grid g2">${fieldHtml.join('')}<div class="actions full">${row && can(`${cfg.perm}.${cfg.write || 'delete'}`) ? '<button type="button" class="btn danger" data-del>Delete</button>' : ''}<button type="button" class="btn" data-x>Cancel</button><button class="btn primary">Save</button></div></form>`, { onClose: () => { if (!saved && onCancel) onCancel(); } });
+  const m = modal(`<h2>${row ? 'Edit' : 'Add'} ${cfg.noun}</h2><form class="grid g2">${fieldHtml.join('')}<div class="actions full">${row && !cfg.noDelete && can(`${cfg.perm}.${cfg.write || 'delete'}`) ? '<button type="button" class="btn danger" data-del>Delete</button>' : ''}<button type="button" class="btn" data-x>Cancel</button><button class="btn primary">Save</button></div></form>`, { onClose: () => { if (!saved && onCancel) onCancel(); } });
   const form = $('form', m.el);
   $$('[data-img]', m.el).forEach((w) => {
     const img = $('img', w), file = $('input[type=file]', w), hid = $('input[type=hidden]', w), clr = $('[data-clr]', w);
@@ -1207,6 +1314,7 @@ async function crudForm(cfg, row, done, onCancel) {
     for (const f of cfg.fields) {
       const inp = form.elements[f.k];
       if (f.t === 'checkbox') body[f.k] = inp.checked;
+      else if (f.t === 'multi') body[f.k] = JSON.parse(inp.value || '[]');
       else if (f.t === 'number') body[f.k] = inp.value === '' ? 0 : +inp.value;
       else if (f.t === 'password' && !inp.value) continue;
       else body[f.k] = inp.value;
@@ -1216,12 +1324,208 @@ async function crudForm(cfg, row, done, onCancel) {
   });
 }
 
+/* ------------------------------------------------------------ tasks */
+const TASK_PRI = [{ v: 'high', l: 'High' }, { v: 'medium', l: 'Medium' }, { v: 'low', l: 'Low' }];
+const TASK_ST = [{ v: 'todo', l: 'To do' }, { v: 'in_progress', l: 'In progress' }, { v: 'done', l: 'Done' }];
+CFG.tasks = {
+  title: 'Tasks', api: '/tasks', perm: 'tasks', noun: 'task',
+  fields: [
+    { k: 'title', l: 'Title', req: 1, full: 1 }, { k: 'description', l: 'Description', t: 'textarea', full: 1 },
+    { k: 'due_date', l: 'Due date', t: 'date' }, { k: 'assignees', l: 'Assigned to', t: 'multi', val: (r) => (r.assignees || []).map((a) => a.id) },
+    { k: 'priority', l: 'Priority', t: 'select', opts: TASK_PRI }, { k: 'status', l: 'Status', t: 'select', opts: TASK_ST },
+  ],
+  defaults: { priority: 'medium', status: 'todo' },
+  onOpen(form) {
+    const dot = (k) => (o) => (o.value ? `<span class="pm-l ${k}-${o.value} pm-c"><span class="tdot"></span></span><span>${esc(o.text)}</span>` : `<span>${esc(o.text)}</span>`);
+    const person = (o) => +o.value === S.user.id ? `<span class="pm-l">${youChip(`${esc(o.text)} <small class="muted">(you)</small>`)}</span>` : `<span class="pm-l">${o.value ? avatar(o.text, 'xs') : '<span class="av xs none">?</span>'}<span class="${o.value ? '' : 'muted'}">${esc(o.text)}${+o.value === S.user.id ? ' <small class="muted">(you)</small>' : ''}</span></span>`;
+    fancySelect(form.elements.priority, dot('priority')); fancySelect(form.elements.status, dot('status')); multiPeople(form.elements.assignees);
+  },
+};
+// Avatars + names for a list of people ("You" first)
+const peopleChips = (list, max = 2) => {
+  if (!list.length) return '<span class="av xs none">?</span><span class="muted">Unassigned</span>';
+  const sorted = [...list].sort((a, b) => (b.id === S.user.id) - (a.id === S.user.id));
+  const names = sorted.map((p) => (p.id === S.user.id ? 'You' : p.name));
+  return `<span class="avstack">${sorted.slice(0, 3).map((p) => (p.id === S.user.id ? `<span class="av xs you">${esc(initials(S.user.name))}</span>` : avatar(p.name, 'xs'))).join('')}</span>
+    <span class="pp-names" title="${esc(names.join(', '))}">${esc(names.slice(0, max).join(', '))}${names.length > max ? ` <small class="muted">+${names.length - max}</small>` : ''}</span>`;
+};
+const personOpt = (p) => `<span class="pm-l">${p.id === S.user.id ? youChip(`${esc(p.name)} <small class="muted">(you)</small>`) : `${avatar(p.name, 'xs')}<span>${esc(p.name)}</span>`}</span>`;
+// Multi-person picker over a hidden JSON input (task form "Assigned to")
+async function multiPeople(inp) {
+  if (!inp) return;
+  const people = await api('/tasks/people'), b = document.createElement('button');
+  b.type = 'button'; b.className = 'fsel'; b.setAttribute('aria-haspopup', 'listbox'); b.setAttribute('aria-expanded', 'false'); b.setAttribute('aria-label', 'Assigned to');
+  const val = () => JSON.parse(inp.value || '[]').map(Number);
+  const paint = () => { b.innerHTML = `<span class="fsel-v">${peopleChips(people.filter((p) => val().includes(p.id)), 3)}</span><svg class="tcaret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`; };
+  inp.after(b); paint();
+  b.onclick = () => {
+    if (b.getAttribute('aria-expanded') === 'true') return $$('.pmenu').forEach((m) => m.remove()), b.setAttribute('aria-expanded', 'false');
+    pickMenu(b, people.map((p) => ({ v: p.id, html: personOpt(p) })), val(), (ids) => { inp.value = JSON.stringify(ids.map(Number)); paint(); }, { multi: true });
+    const m = $('.pmenu'); if (m) m.style.minWidth = b.offsetWidth + 'px';
+  };
+}
+// Replace a native <select> with a button that opens pickMenu; the select stays (hidden) as the form value.
+function fancySelect(sel, render) {
+  if (!sel) return;
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'fsel'; b.setAttribute('aria-haspopup', 'listbox'); b.setAttribute('aria-expanded', 'false');
+  const lab = sel.closest('.field')?.querySelector('label'); if (lab) b.setAttribute('aria-label', lab.textContent);
+  const paint = () => { const o = sel.options[sel.selectedIndex]; b.innerHTML = `<span class="fsel-v">${o ? render(o) : ''}</span><svg class="tcaret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`; };
+  sel.hidden = true; sel.after(b); paint();
+  b.onclick = () => {
+    if (b.getAttribute('aria-expanded') === 'true') return $$('.pmenu').forEach((m) => m.remove()), b.setAttribute('aria-expanded', 'false');
+    pickMenu(b, [...sel.options].map((o) => ({ v: o.value, html: render(o) })), sel.value, (v) => { sel.value = v; sel.dispatchEvent(new Event('change', { bubbles: true })); paint(); });
+    const m = $('.pmenu'); if (m) m.style.minWidth = b.offsetWidth + 'px';
+  };
+}
+// Small floating option menu anchored to a button (used by the task table pills)
+function pickMenu(anchor, opts, cur, onPick, { multi = false } = {}) {
+  const sel = new Set(multi ? (cur || []).map(String) : [String(cur)]), start = [...sel].sort().join();
+  $$('.pmenu').forEach((m) => m.remove());
+  const m = document.createElement('div');
+  m.className = 'pmenu'; m.setAttribute('role', 'listbox');
+  if (multi) m.setAttribute('aria-multiselectable', 'true');
+  m.innerHTML = opts.map((o, i) => `<button type="button" role="option" data-i="${i}" aria-selected="${sel.has(String(o.v))}" class="${sel.has(String(o.v)) ? 'on' : ''} ${multi ? 'multi' : ''}">${o.html}<span class="pm-check">${ic('check', 15)}</span></button>`).join('');
+  document.body.append(m);
+  const r = anchor.getBoundingClientRect(), w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.left, innerWidth - w - 8)) + 'px';
+  m.style.top = (r.bottom + h + 8 > innerHeight && r.top > h + 8 ? r.top - h - 6 : r.bottom + 6) + 'px';
+  anchor.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => m.classList.add('open'));
+  const close = () => { if (!m.isConnected) return; m.remove(); if (multi && [...sel].sort().join() !== start) onPick([...sel]); anchor.setAttribute('aria-expanded', 'false'); document.removeEventListener('mousedown', out, true); document.removeEventListener('keydown', key, true); removeEventListener('scroll', close, true); removeEventListener('resize', close); };
+  const out = (e) => { if (!m.contains(e.target) && !anchor.contains(e.target)) close(); };
+  const btns = $$('button', m), focus = (i) => btns[(i + btns.length) % btns.length].focus();
+  const key = (e) => {
+    const i = btns.indexOf(document.activeElement);
+    if (e.key === 'Escape') { close(); anchor.focus(); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'ArrowDown') { focus(i + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { focus(i - 1); e.preventDefault(); }
+  };
+  document.addEventListener('mousedown', out, true); document.addEventListener('keydown', key, true);
+  addEventListener('scroll', close, true); addEventListener('resize', close);
+  btns.forEach((b) => (b.onclick = () => {
+    const o = opts[+b.dataset.i];
+    if (multi) { const k = String(o.v), on = !sel.has(k); on ? sel.add(k) : sel.delete(k); b.classList.toggle('on', on); b.setAttribute('aria-selected', on); return; }
+    close(); if (String(o.v) !== String(cur)) onPick(o.v);
+  }));
+  (btns.find((b) => b.classList.contains('on')) || btns[0]).focus();
+}
+// Tasks page filters: a view tab plus search / status / priority (kept while you move around the app)
+const TASK_F = { tab: 'all', q: '', status: '', priority: '' };
+const TASK_TABS = [{ v: 'all', l: 'All tasks' }, { v: 'mine', l: 'Assigned to me' }, { v: 'byme', l: 'Assigned by me' }, { v: 'overdue', l: 'Overdue' }, { v: 'done', l: 'Completed' }];
+async function viewTasks(el) {
+  const all_ = await api('/tasks'), me = S.user.id, F = TASK_F, t0 = todayStr();
+  const mine = (r) => r.assignees.some((a) => a.id === me);
+  const inTab = (r, tab) => ({ all: true, mine: mine(r), byme: r.assigned_by === me, overdue: r.status !== 'done' && r.due_date && r.due_date < t0, done: r.status === 'done' }[tab]);
+  const q = F.q.trim().toLowerCase();
+  const rows = all_.filter((r) => inTab(r, F.tab) && (!F.status || r.status === F.status) && (!F.priority || r.priority === F.priority)
+    && (!q || [r.title, r.description, r.assigned_by_name, ...r.assignees.map((a) => a.name)].some((v) => (v || '').toLowerCase().includes(q))));
+  const pg = paginate(['tasks', F.tab, F.status, F.priority].join('-'), rows);
+  // filter buttons that open the same option menu as the table pills
+  const fbtn = (k, l, opts) => { const cur = opts.find((o) => o.v === F[k]);
+    return `<button type="button" class="tfbtn ${cur ? 'set' : ''}" data-f="${k}" aria-haspopup="listbox" aria-expanded="false">${cur ? `<span class="pm-c ${k}-${cur.v}"><span class="tdot"></span></span>` : ''}<span class="tf-l">${l}</span><b>${cur ? cur.l : 'All'}</b><svg class="tcaret" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>`; };
+  // the assigner (or an org admin) manages the task; the assignee can only move its status
+  const manage = (r) => S.user.isAdmin || r.assigned_by === me;
+  const canStatus = (r) => manage(r) || mine(r);
+  const caret = '<svg class="tcaret" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+  const pill = (r, k, opts, editable) => {
+    const lb = opts.find((o) => o.v === r[k])?.l || '';
+    return editable
+      ? `<button type="button" class="tpill ${k}-${esc(r[k])}" data-id="${r.id}" data-k="${k}" aria-haspopup="listbox" aria-expanded="false" aria-label="${k === 'status' ? 'Status' : 'Priority'}: ${lb}"><span class="tdot"></span>${lb}${caret}</button>`
+      : `<span class="tpill ro ${k}-${esc(r[k])}"><span class="tdot"></span>${lb}</span>`;
+  };
+  const due = (r) => {
+    if (!r.due_date) return '<span class="muted">—</span>';
+    const days = Math.round((new Date(r.due_date) - new Date(todayStr())) / 864e5), open = r.status !== 'done';
+    const note = !open ? '' : days < 0 ? `<small class="tlate">${-days}d overdue</small>` : days === 0 ? '<small class="tsoon">Due today</small>' : days <= 3 ? `<small class="tsoon">In ${days}d</small>` : '';
+    return `<div class="tdue">${dmy(r.due_date)}${note}</div>`;
+  };
+  const who = (name) => (name ? `${avatar(name, 'xs')}<span>${esc(name)}</span>` : '<span class="av xs none">?</span><span class="muted">Unassigned</span>');
+  // you appear as "You" (e.g. in Assigned by on tasks you created)
+  const person = (id, name) => `<div class="tperson" title="${esc(name || '')}">${id === me ? youChip() : who(name)}</div>`;
+  const assignee = (r) => (manage(r)
+    ? `<button type="button" class="tperson tpick" data-id="${r.id}" data-k="assignees" aria-haspopup="listbox" aria-expanded="false" aria-label="Assigned to: ${esc(r.assignees.map((a) => a.name).join(', ') || 'Unassigned')}">${peopleChips(r.assignees)}${caret}</button>`
+    : `<div class="tperson">${peopleChips(r.assignees)}</div>`);
+  el.innerHTML = `<div class="pagehead"><h1>Tasks</h1>
+      ${can('tasks.create') ? `<button class="btn primary" id="add">${ic('plus')} Add task</button>` : ''}</div>
+    ${all_.length ? `<div class="ttabs" role="tablist">${TASK_TABS.map((t) => `<button type="button" role="tab" aria-selected="${F.tab === t.v}" class="${F.tab === t.v ? 'on' : ''}" data-tab="${t.v}">${t.v === 'all' && !S.user.isAdmin ? 'My tasks' : t.l}<span class="tcount">${all_.filter((r) => inTab(r, t.v)).length}</span></button>`).join('')}</div>
+    <div class="tfilters"><label class="tsearch">${ic('search', 16)}<input id="tq" type="search" placeholder="Search tasks or people…" value="${esc(F.q)}" aria-label="Search tasks"></label>
+      ${fbtn('status', 'Status', TASK_ST)}${fbtn('priority', 'Priority', TASK_PRI)}
+      ${F.q || F.status || F.priority ? '<button type="button" class="btn sm" id="tclr">Clear</button>' : ''}</div>` : ''}
+    ${rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable tasktable"><thead><tr><th>Title</th><th>Description</th><th>Due date</th><th>Priority</th><th>Status</th><th>Assigned to</th><th>Assigned by</th><th></th></tr></thead><tbody>
+      ${pg.rows.map((r) => `<tr class="${r.status === 'done' ? 'tdone' : ''}"><td class="first" data-label="Title"><span class="ttitle">${esc(r.title)}</span></td>
+        <td data-label="Description" class="tdesc">${r.description ? `<span title="${esc(r.description)}">${esc(r.description)}</span>` : '<span class="muted">—</span>'}</td>
+        <td data-label="Due date" class="nowrap">${due(r)}</td>
+        <td data-label="Priority">${pill(r, 'priority', TASK_PRI, manage(r))}</td><td data-label="Status">${pill(r, 'status', TASK_ST, canStatus(r))}</td>
+        <td data-label="Assigned to">${assignee(r)}</td><td data-label="Assigned by">${person(r.assigned_by, r.assigned_by_name)}</td>
+        <td class="acts nowrap">${manage(r) ? `<button class="ibtn tact" data-e="${r.id}" title="Edit" aria-label="Edit task">${ic('edit', 16)}</button>${can('tasks.delete') ? `<button class="ibtn tact bad" data-d="${r.id}" title="Delete" aria-label="Delete task">${ic('trash', 16)}</button>` : ''}` : ''}</td></tr>`).join('')}</tbody></table></div>${pg.html}`
+      : `<div class="empty card">${ic('check', 28)}<p>${all_.length ? 'No tasks match these filters.' : 'No tasks yet.'}</p></div>`}`;
+  const reload = () => viewTasks(el);
+  el.classList.add('still'); // filter changes re-render in place, without the page fade
+  $$('[data-tab]', el).forEach((b) => (b.onclick = () => { F.tab = b.dataset.tab; reload(); }));
+  if ($('#tq', el)) {
+    let tm; $('#tq', el).oninput = (e) => { clearTimeout(tm); tm = setTimeout(async () => { F.q = e.target.value; await reload(); const i = $('#tq', el); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
+    $$('[data-f]', el).forEach((b) => (b.onclick = () => {
+      if (b.getAttribute('aria-expanded') === 'true') return $$('.pmenu').forEach((m) => m.remove()), b.setAttribute('aria-expanded', 'false');
+      const k = b.dataset.f, list = k === 'status' ? TASK_ST : TASK_PRI;
+      const opts = [{ v: '', html: `<span class="pm-l pm-c pm-all"><span class="tdot"></span></span><span>All ${k === 'status' ? 'statuses' : 'priorities'}</span>` },
+        ...list.map((o) => ({ v: o.v, html: `<span class="pm-l ${k}-${o.v} pm-c"><span class="tdot"></span></span><span>${o.l}</span><span class="pm-n">${all_.filter((r) => inTab(r, F.tab) && r[k] === o.v).length}</span>` }))];
+      pickMenu(b, opts, F[k], (v) => { F[k] = v; reload(); });
+    }));
+    if ($('#tclr', el)) $('#tclr', el).onclick = () => { Object.assign(F, { q: '', status: '', priority: '' }); reload(); };
+  }
+  pg.bind(el, reload);
+  if ($('#add', el)) $('#add', el).onclick = () => crudForm(CFG.tasks, null, reload);
+  $$('[data-e]', el).forEach((b) => (b.onclick = () => crudForm(CFG.tasks, rows.find((r) => r.id === +b.dataset.e), reload)));
+  $$('[data-d]', el).forEach((b) => (b.onclick = guard(async () => {
+    if (!(await confirmBox('Delete this task?'))) return;
+    await api('/tasks/' + b.dataset.d, { method: 'DELETE' }); toast('Deleted'); reload();
+  })));
+  const save = guard(async (id, k, v) => {
+    try { await api('/tasks/' + id, { method: 'PUT', body: { [k]: v } }); toast('Task updated'); } finally { reload(); }
+  });
+  let people;
+  $$('button.tpill, button.tpick', el).forEach((b) => (b.onclick = guard(async () => {
+    if (b.getAttribute('aria-expanded') === 'true') return $$('.pmenu').forEach((m) => m.remove()), b.setAttribute('aria-expanded', 'false');
+    const r = rows.find((x) => x.id === +b.dataset.id), k = b.dataset.k;
+    let opts;
+    if (k === 'assignees') {
+      people = people || (await api('/tasks/people'));
+      // assignees outside your pickable list (e.g. an admin, for a team member) stay as they are
+      const keep = r.assignees.filter((a) => !people.some((p) => p.id === a.id)).map((a) => a.id);
+      return pickMenu(b, people.map((p) => ({ v: p.id, html: personOpt(p) })), r.assignees.map((a) => a.id), (ids) => save(r.id, 'assignees', [...keep, ...ids.map(Number)]), { multi: true });
+    } else opts = (k === 'status' ? TASK_ST : TASK_PRI).map((o) => ({ v: o.v, html: `<span class="pm-l ${k}-${o.v} pm-c"><span class="tdot"></span></span><span>${o.l}</span>` }));
+    pickMenu(b, opts, r[k] ?? '', (v) => save(r.id, k, v));
+  })));
+}
+
 /* ------------------------------------------------------------ settings */
-async function viewSettings(el) {
+// Settings → General: the organisation's details (shown on invoices) with one Add / Edit button
+async function orgDetailsCard(el) {
+  const o = (await api('/organisations'))[0], edit = can('settings.edit');
+  const kv = (k, v) => `<div class="kv"><span>${k}</span><b>${v ? esc(v) : '<span class="muted">—</span>'}</b></div>`;
+  el.innerHTML = `<div class="pagehead"><h2>Organisation details</h2>${edit ? `<button class="btn primary" id="od-edit">${o ? `${ic('edit', 15)} Edit details` : `${ic('plus', 15)} Add details`}</button>` : ''}</div>
+    ${o ? `<div class="card od-card orgd">${o.logo ? `<img class="orgd-logo" src="${esc(o.logo)}" alt="">` : ''}<div class="orgd-grid">
+      ${kv('Name', o.name)}${kv('GSTIN', o.gst_number)}${kv('PAN', o.pan_number)}${kv('State', o.state && `${o.state}${o.state_code ? ` (${o.state_code})` : ''}`)}
+      ${kv('Email', o.email)}${kv('Phone', o.contact)}${kv('UPI ID', o.upi_id)}${kv('Bank details', o.bank_details ? 'Added' : '')}${kv('Address', o.address)}</div></div>`
+      : '<div class="empty card">No organisation details yet.</div>'}`;
+  if ($('#od-edit', el)) $('#od-edit', el).onclick = () => crudForm({ ...CFG.organisations, noun: 'organisation details', noDelete: true }, o || null, () => orgDetailsCard(el));
+}
+
+// Settings has tabs: General, Templates and Activity log (the last two used to be sidebar pages)
+async function viewSettings(el, tab) {
+  const tabs = [can('settings.view') || S.user.isAdmin ? { id: 'general', l: 'General', h: '#/settings' } : null, can('users.view') ? { id: 'users', l: 'Users', h: '#/users' } : null, can('templates.view') ? { id: 'templates', l: 'Templates', h: '#/templates' } : null, can('activity.view') ? { id: 'activity', l: 'Activity log', h: '#/activity' } : null].filter(Boolean);
+  if (!tabs.length) { el.innerHTML = '<div class="empty card">You don\'t have access to this page.</div>'; return; }
+  const cur = tabs.find((t) => t.id === tab) || tabs[0];
   el.innerHTML = `<div class="pagehead"><h1>Settings</h1></div>
-    ${S.user.isAdmin ? '<div id="s0" style="margin-top:22px"></div>' : ''}<div id="s1" style="margin-top:22px"></div><div id="s2" style="margin-top:22px"></div>`;
+    <div class="settabs">${tabs.map((t) => `<a class="${t.id === cur.id ? 'on' : ''}" href="${t.h}">${t.l}</a>`).join('')}</div><div id="stab"></div>`;
+  const body = $('#stab', el);
+  if (cur.id === 'users') return crudView(body, CFG.users);
+  if (cur.id === 'templates') return crudView(body, CFG.templates);
+  if (cur.id === 'activity') return viewActivity(body);
+  body.innerHTML = `${S.user.isAdmin ? '<div id="s0" style="margin-top:22px"></div>' : ''}<div id="s1" style="margin-top:22px"></div><div id="s2" style="margin-top:22px"></div>`;
   if (S.user.isAdmin) await inviteCard($('#s0'));
-  if (can('settings.view')) { await crudView($('#s1'), CFG.organisations); await crudView($('#s2'), CFG.ccEmails); }
+  if (can('settings.view')) { await orgDetailsCard($('#s1')); await crudView($('#s2'), CFG.ccEmails); }
 }
 
 /* ------------------------------------------------------------ public client page (/p/<token>) */
@@ -1495,42 +1799,105 @@ function openVoice() {
 
 /* ------------------------------------------------------------ platform management */
 let mgmtQ = '';
+// Platform overview: organisations and their people only (no business data reaches management)
 async function viewManagement(el) {
   const d = await api('/management/organisations');
   const tile = (icn, tone, label, val) => `<div class="stat ${tone}"><span class="stat-ic">${ic(icn, 19)}</span><div class="stat-b"><div class="stat-l">${label}</div><div class="stat-v">${val}</div></div></div>`;
-  const yes = (v) => (v ? '<span class="pill paid">Done</span>' : '<span class="pill unpaid">Skipped</span>');
+  const mods = (r) => d.modules.filter((m) => r.modules.includes(m.id)).map((m) => m.label).join(', ');
   const draw = () => {
     const q = mgmtQ.toLowerCase();
     const rows = d.rows.filter((r) => !q || `${r.name} ${r.creator_email} ${r.invite_code} ${r.gst_number || ''}`.toLowerCase().includes(q));
     const pg = paginate('mgmt', rows);
     $('#mt', el).innerHTML = rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable mgmt"><thead><tr>
-        <th>Organisation</th><th>Created by</th><th>Created</th><th>Code</th><th class="num">Members</th><th class="num">Pending</th><th class="num">Clients</th><th class="num">Invoices</th><th class="num">Billed</th><th class="num">Outstanding</th><th>Details</th><th>Bank</th><th>Last activity</th></tr></thead><tbody>
+        <th>Organisation</th><th>Status</th><th>Created by</th><th class="num">Members</th><th class="num">Pending</th><th>Modules</th><th></th></tr></thead><tbody>
       ${pg.rows.map((r) => `<tr><td class="first" data-label="Organisation"><b>${esc(r.name)}</b>${r.gst_number ? `<div class="small muted">${esc(r.gst_number)}</div>` : ''}</td>
-        <td data-label="Created by">${esc(r.creator_name || '—')}<div class="small muted">${esc(r.creator_email || '')}</div></td>
-        <td data-label="Created" class="nowrap">${fmtLong(r.created_at)}</td><td data-label="Code"><code>${esc(r.invite_code)}</code></td>
+        <td data-label="Status">${r.active ? '<span class="pill paid">Active</span>' : '<span class="pill unpaid">Deactivated</span>'}</td>
+        <td data-label="Created by">${esc(r.creator_name || '—')}<div class="small muted">${esc(r.creator_email || '')} · ${fmtLong(r.created_at)}</div></td>
         <td class="num" data-label="Members">${r.members}<div class="small muted">${r.admins} admin</div></td>
         <td class="num" data-label="Pending">${r.pending ? `<span class="pill partial">${r.pending}</span>` : 0}${r.rejected ? `<div class="small muted">${r.rejected} rejected</div>` : ''}</td>
-        <td class="num" data-label="Clients">${r.clients}</td><td class="num" data-label="Invoices">${r.invoices}</td>
-        <td class="num" data-label="Billed">${money0(r.billed)}</td><td class="num" data-label="Outstanding">${money0(r.outstanding)}</td>
-        <td data-label="Details">${yes(r.has_details)}</td><td data-label="Bank">${yes(r.has_bank)}</td>
-        <td data-label="Last activity" class="nowrap">${r.last_activity ? fmtLong(r.last_activity) : '—'}</td></tr>`).join('')}</tbody></table></div>${pg.html}`
+        <td data-label="Modules" class="small">${esc(mods(r))}</td>
+        <td class="acts nowrap"><button class="btn sm" data-view="${r.id}">${ic('users', 15)} Members</button></td></tr>`).join('')}</tbody></table></div>${pg.html}`
       : '<div class="empty card">No organisations match.</div>';
     pg.bind(el, draw);
+    $$('[data-view]', el).forEach((b) => (b.onclick = guard(() => orgDetails(+b.dataset.view, d.modules))));
   };
-  el.innerHTML = `<div class="pagehead"><div><h1>Management</h1><div class="muted small">Every organisation on this installation. Bank details are never shown here.</div></div>
+  el.innerHTML = `<div class="pagehead"><h1>Dashboard</h1>
       <button class="btn" id="mx">${ic('download')} Export CSV</button></div>
-    <div class="mgmt-stats">${tile('grid', 'brand', 'Organisations', d.totals.organisations)}${tile('users', 'ok', 'Active members', d.totals.members)}
-      ${tile('clock', 'bad', 'Pending requests', d.totals.pending)}${tile('file', 'grey', 'Invoices', d.totals.invoices)}${tile('rupee', 'brand', 'Total billed', money0(d.totals.billed))}</div>
+    <div class="mgmt-stats">${tile('grid', 'brand', 'Organisations', d.totals.organisations)}${tile('check', 'ok', 'Active organisations', d.totals.active)}
+      ${tile('users', 'ok', 'Members', d.totals.members)}${tile('clock', 'bad', 'Pending requests', d.totals.pending)}${tile('user', 'grey', 'User accounts', d.totals.users)}</div>
     <div class="inwrap" style="margin:16px 0 12px;max-width:360px">${ic('search', 18)}<input id="mq" placeholder="Search organisation, email, code…" value="${esc(mgmtQ)}"></div>
     <div id="mt"></div>`;
   $('#mq', el).oninput = (e) => { mgmtQ = e.target.value; resetPg('mgmt'); draw(); };
   $('#mx', el).onclick = () => {
-    const head = ['Organisation', 'GSTIN', 'Created by', 'Creator email', 'Created', 'Invite code', 'Members', 'Admins', 'Pending', 'Rejected', 'Clients', 'Invoices', 'Billed', 'Outstanding', 'Details', 'Bank', 'Last activity'];
+    const head = ['Organisation', 'Status', 'GSTIN', 'Created by', 'Creator email', 'Created', 'Invite code', 'Members', 'Admins', 'Pending', 'Rejected', 'Modules'];
     const cell = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const lines = [head, ...d.rows.map((r) => [r.name, r.gst_number, r.creator_name, r.creator_email, r.created_at, r.invite_code, r.members, r.admins, r.pending, r.rejected, r.clients, r.invoices, r.billed, r.outstanding, r.has_details ? 'yes' : 'no', r.has_bank ? 'yes' : 'no', r.last_activity])];
-    downloadBlob(new Blob(['\ufeff' + lines.map((l) => l.map(cell).join(',')).join('\r\n')], { type: 'text/csv' }), 'organisations.csv');
+    const lines = [head, ...d.rows.map((r) => [r.name, r.active ? 'active' : 'deactivated', r.gst_number, r.creator_name, r.creator_email, r.created_at, r.invite_code, r.members, r.admins, r.pending, r.rejected, mods(r)])];
+    downloadBlob(new Blob(['﻿' + lines.map((l) => l.map(cell).join(',')).join('\r\n')], { type: 'text/csv' }), 'organisations.csv');
   };
   draw();
+}
+
+/* ------------------------------------------------------------ management: organisations (modules, status, delete) */
+async function viewOrgControl(el) {
+  const d = await api('/management/organisations');
+  const toggle = (r, m) => `<label class="mswitch" title="${esc(m.label)}"><input type="checkbox" data-org="${r.id}" data-mod="${m.id}" ${r.modules.includes(m.id) ? 'checked' : ''}><span class="ms-track"><span class="ms-knob"></span></span><span>${esc(m.label)}</span></label>`;
+  el.innerHTML = `<div class="pagehead"><h1>Organisations</h1></div>
+    ${d.rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable orgctl"><thead><tr><th>Organisation</th><th>Status</th><th>Modules</th><th class="num">Members</th><th></th></tr></thead><tbody>
+      ${d.rows.map((r) => `<tr class="${r.active ? '' : 'off'}"><td class="first" data-label="Organisation"><b>${esc(r.name)}</b><div class="small muted">${esc(r.creator_email || '')}</div></td>
+        <td data-label="Status">${r.active ? '<span class="pill paid">Active</span>' : '<span class="pill unpaid">Deactivated</span>'}</td>
+        <td data-label="Modules"><div class="mods">${d.modules.map((m) => toggle(r, m)).join('')}</div></td>
+        <td class="num" data-label="Members">${r.members}</td>
+        <td class="acts nowrap"><button class="btn sm" data-view="${r.id}">${ic('users', 15)} Members</button>
+          <button class="btn sm" data-act="${r.id}">${r.active ? 'Deactivate' : 'Activate'}</button>
+          <button class="ibtn tact bad" data-del="${r.id}" title="Delete organisation" aria-label="Delete ${esc(r.name)}">${ic('trash', 16)}</button></td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty card">No organisations yet.</div>'}`;
+  const reload = () => viewOrgControl(el);
+  const row = (id) => d.rows.find((r) => r.id === +id);
+  $$('[data-mod]', el).forEach((cb) => (cb.onchange = guard(async () => {
+    const r = row(cb.dataset.org), mods = $$(`[data-org="${r.id}"]`, el).filter((x) => x.checked).map((x) => x.dataset.mod);
+    try { await api('/management/organisations/' + r.id, { method: 'PUT', body: { modules: mods } }); toast(`${r.name}: modules updated`); }
+    catch (e) { cb.checked = !cb.checked; throw e; }
+    r.modules = mods;
+  })));
+  $$('[data-act]', el).forEach((b) => (b.onclick = guard(async () => {
+    const r = row(b.dataset.act);
+    if (r.active && !(await confirmBox(`Deactivate ${r.name}? Its members won't be able to use the app until you activate it again. No data is deleted.`, { ok: 'Deactivate' }))) return;
+    await api('/management/organisations/' + r.id, { method: 'PUT', body: { active: !r.active } });
+    toast(`${r.name} ${r.active ? 'deactivated' : 'activated'}`); reload();
+  })));
+  $$('[data-del]', el).forEach((b) => (b.onclick = () => {
+    const r = row(b.dataset.del);
+    const m = modal(`<h2>Delete ${esc(r.name)}?</h2><p class="muted">This permanently deletes the organisation and all its invoices, payments, clients, tasks and settings. Member accounts are kept but lose access. This cannot be undone.</p>
+      <form><div class="field"><label>Type <b>${esc(r.name)}</b> to confirm</label><input name="c" autocomplete="off" required></div>
+      <div class="actions"><button type="button" class="btn" data-x>Cancel</button><button class="btn danger" disabled>Delete organisation</button></div></form>`);
+    const f = $('form', m.el), go = $('.btn.danger', m.el);
+    f.c.oninput = () => (go.disabled = f.c.value.trim().toLowerCase() !== r.name.trim().toLowerCase());
+    $('[data-x]', m.el).onclick = m.close;
+    f.onsubmit = guard(async (e) => {
+      e.preventDefault();
+      await api('/management/organisations/' + r.id, { method: 'DELETE', body: { confirm: f.c.value } });
+      m.close(); toast(`${r.name} deleted`); reload();
+    });
+    f.c.focus();
+  }));
+  $$('[data-view]', el).forEach((b) => (b.onclick = guard(() => orgDetails(+b.dataset.view, d.modules))));
+}
+async function orgDetails(id, modules) {
+  const d = await api('/management/organisations/' + id), o = d.organisation;
+  const active = d.members.filter((u) => u.status === 'approved');
+  const m = modal(`<div class="od">
+    <div class="row sp"><div><h2>${esc(o.name)}</h2><div class="small muted">Created ${fmtLong(o.created_at)}${o.creator ? ` by ${esc(o.creator.name)} (${esc(o.creator.email)})` : ''}</div></div>
+      ${o.active ? '<span class="pill paid">Active</span>' : '<span class="pill unpaid">Deactivated</span>'}</div>
+    <div class="od-mods">${modules.map((x) => `<span class="pill ${o.modules.includes(x.id) ? 'paid' : 'unpaid'}">${esc(x.label)} ${o.modules.includes(x.id) ? 'on' : 'off'}</span>`).join('')}
+      <span class="small muted">Invite code <code>${esc(o.invite_code)}</code>${o.gst_number ? ` · GSTIN ${esc(o.gst_number)}` : ''}${o.state ? ` · ${esc(o.state)}` : ''}</span></div>
+    <h3>Members <span class="muted">(${active.length} active${d.members.length > active.length ? `, ${d.members.length - active.length} other` : ''})</span></h3>
+    <div class="card tablewrap" style="padding:0"><table class="od-table"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Joined</th></tr></thead><tbody>
+      ${d.members.map((u) => `<tr><td><div class="tperson">${avatar(u.name, 'xs')}<span>${esc(u.name)}<div class="small muted">${esc(u.email)}</div></span></div></td>
+        <td>${u.role === 'admin' ? 'Admin' : esc(u.user_type || 'Member')}</td><td><span class="pill ${u.status === 'approved' ? (u.active ? 'paid' : 'unpaid') : u.status === 'pending' ? 'partial' : 'unpaid'}">${u.status === 'approved' ? (u.active ? 'Active' : 'Disabled') : esc(u.status)}</span></td>
+        <td class="nowrap">${fmtLong(u.decided_at || u.created_at)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="actions"><button class="btn" data-x>Close</button></div></div>`);
+  m.el.classList.add('wide');
+  $('[data-x]', m.el).onclick = m.close;
 }
 
 /* ------------------------------------------------------------ organisation signup, join & approval */
@@ -1757,6 +2124,11 @@ function renderMembership() {
       if (!(await confirmBox('Cancel your request to join this organisation?'))) return;
       await api('/membership/cancel', { method: 'POST' }); S.user.membership = null; renderMembership();
     });
+  } else if (st === 'deactivated') {
+    authShell(`<div class="auth-card"><span class="ob-badge bad">${ic('lock', 26)}</span><h1>Organisation deactivated</h1>
+        <p class="lead"><b>${esc(m.organisation)}</b> has been deactivated by the platform team, so the app isn't available right now. Your data is safe; contact support or your organisation admin to get it reactivated.</p>
+        <div class="stack"><button class="btn" id="ck">Check again</button></div>${who}</div>`);
+    $('#ck').onclick = guard(async () => { S.user = (await api('/me')).user; if (S.user.membership?.status === 'approved') boot(); else toast('Still deactivated', true); });
   } else {
     const declined = st === 'rejected';
     authShell(`<form class="auth-card" id="mf" novalidate>

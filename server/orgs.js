@@ -1,8 +1,9 @@
 // Organisation signup, join-by-code and membership approval.
 // A "tenant" is the organisation people sign up for; everything else in the app is scoped to req.user.tid.
-import { all, get, run, tx, normCode, newInviteCode } from './db.js';
+import { db, all, get, run, tx, normCode, newInviteCode } from './db.js';
 import { createTenant, DEFAULT_MEMBER_ROLE } from './seed.js';
 import { logAct } from './activity.js';
+import { MODULES, ALL_MODULES, tenantModules } from './modules.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
@@ -25,6 +26,19 @@ const parseBank = (text) => Object.fromEntries(BANK_FIELDS.map(([k, label]) => {
   return [k, m ? m[1].trim() : ''];
 }));
 const mask = (n) => (n ? '•'.repeat(Math.max(0, n.length - 4)) + n.slice(-4) : '');
+
+// Permanently delete an organisation and everything it owns (used by the management API and the assistant).
+// User accounts stay; they can join or create another organisation.
+export function deleteTenant(tid) {
+  const tables = all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN ('tenants', 'sqlite_sequence')").map((r) => r.name)
+    .filter((tb) => all(`PRAGMA table_info(${tb})`).some((c) => c.name === 'tenant_id'));
+  tx(() => {
+    db.exec('PRAGMA defer_foreign_keys = ON'); // rows reference each other (invoices -> clients); check once at commit
+    run('UPDATE users SET role_id = NULL WHERE role_id IN (SELECT id FROM roles WHERE tenant_id = ?)', tid);
+    for (const tb of tables) run(`DELETE FROM ${tb} WHERE tenant_id = ?`, tid);
+    run('DELETE FROM tenants WHERE id = ?', tid);
+  });
+}
 
 export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPassword, newSession, hasPerm }) {
   const cleanEmail = (e) => String(e || '').trim().toLowerCase();
@@ -150,8 +164,8 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
           || get("SELECT id, name, permissions FROM roles WHERE tenant_id = ? AND permissions NOT LIKE '%\"*\"%' ORDER BY id LIMIT 1", req.user.tid);
       if (!role) throw fail(400, 'Pick a role for this member');
       const isAdmin = JSON.parse(role.permissions).includes('*');
-      run("UPDATE memberships SET status = 'approved', role = ?, decided_at = CURRENT_TIMESTAMP, decided_by = ? WHERE id = ?", isAdmin ? 'admin' : 'member', req.user.id, m.id);
-      run('UPDATE users SET role_id = ? WHERE id = ?', role.id, m.user_id);
+      run("UPDATE memberships SET status = 'approved', role = ?, role_id = ?, decided_at = CURRENT_TIMESTAMP, decided_by = ? WHERE id = ?", isAdmin ? 'admin' : 'member', role.id, req.user.id, m.id);
+      if (!get('SELECT role_id FROM users WHERE id = ?', m.user_id)?.role_id) run('UPDATE users SET role_id = ? WHERE id = ?', role.id, m.user_id); // legacy fallback only
       logAct(req.user, 'approve', 'membership', m.id, `${m.email} joined as ${role.name}`);
     });
     return { ok: true };
@@ -163,26 +177,69 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
     return { ok: true };
   }));
 
-  /* ---------------- platform management: every organisation at a glance (no bank details) */
-  base.get('/management/organisations', (req, res, next) => (req.user.isManagement ? next() : res.status(403).json({ error: 'Management access only' })), wrap(() => {
-    const rows = all(`SELECT t.id, t.name, t.invite_code, t.created_at, cu.name AS creator_name, cu.email AS creator_email,
+  /* ---------------- platform management: organisations and their people only.
+     Management never sees an organisation's business data: no invoices, payments, clients, tasks, activity or bank details. */
+  const mgmt = (req, res, next) => (req.user.isManagement ? next() : res.status(403).json({ error: 'Management access only' }));
+  base.get('/management/organisations', mgmt, wrap(() => {
+    const rows = all(`SELECT t.id, t.name, t.invite_code, t.created_at, t.modules, t.active, cu.name AS creator_name, cu.email AS creator_email,
         (SELECT COUNT(*) FROM memberships WHERE tenant_id = t.id AND status = 'approved') AS members,
         (SELECT COUNT(*) FROM memberships WHERE tenant_id = t.id AND status = 'approved' AND role = 'admin') AS admins,
         (SELECT COUNT(*) FROM memberships WHERE tenant_id = t.id AND status = 'pending') AS pending,
         (SELECT COUNT(*) FROM memberships WHERE tenant_id = t.id AND status = 'rejected') AS rejected,
-        (SELECT COUNT(*) FROM clients WHERE tenant_id = t.id) AS clients,
-        (SELECT COUNT(*) FROM invoices WHERE tenant_id = t.id) AS invoices,
-        (SELECT COALESCE(SUM(total_amount),0) FROM invoices WHERE tenant_id = t.id AND invoice_type = 'tax') AS billed,
-        (SELECT COALESCE(SUM(balance_amount),0) FROM invoices WHERE tenant_id = t.id AND invoice_type = 'tax') AS outstanding,
-        (SELECT MAX(created_at) FROM activity_log WHERE tenant_id = t.id) AS last_activity,
-        o.gst_number, o.state, (o.address IS NOT NULL AND o.address != '') OR (o.gst_number IS NOT NULL AND o.gst_number != '') AS has_details,
-        (o.bank_details IS NOT NULL AND TRIM(o.bank_details) != '') AS has_bank
+        o.gst_number, o.state
       FROM tenants t LEFT JOIN users cu ON cu.id = t.created_by
       LEFT JOIN organisations o ON o.id = (SELECT MIN(id) FROM organisations WHERE tenant_id = t.id)
-      ORDER BY t.created_at DESC, t.id DESC`).map((r) => ({ ...r, has_details: !!r.has_details, has_bank: !!r.has_bank }));
+      WHERE t.is_platform = 0 ORDER BY t.created_at DESC, t.id DESC`).map((r) => ({ ...r, modules: tenantModules(r.modules), active: !!r.active }));
     const sum = (k) => rows.reduce((s, r) => s + (r[k] || 0), 0);
-    return { rows, totals: { organisations: rows.length, members: sum('members'), pending: sum('pending'), invoices: sum('invoices'), billed: sum('billed'),
-      users: get('SELECT COUNT(*) AS n FROM users WHERE is_management = 0').n } };
+    return { rows, modules: Object.entries(MODULES).map(([id, m]) => ({ id, label: m.label })),
+      totals: { organisations: rows.length, active: rows.filter((r) => r.active).length, members: sum('members'), pending: sum('pending'),
+          users: get('SELECT COUNT(*) AS n FROM users WHERE is_management = 0').n } };
+  }));
+  // Platform notifications for management: new organisations, members joining, pending join requests (newest first)
+  base.get('/management/notifications', mgmt, wrap(() => all(`
+    SELECT 'org' AS kind, t.id AS org_id, t.name AS org, u.name AS person, t.created_at AS at FROM tenants t LEFT JOIN users u ON u.id = t.created_by WHERE t.is_platform = 0
+    UNION ALL
+    SELECT 'member', t.id, t.name, u.name, COALESCE(m.decided_at, m.created_at) FROM memberships m JOIN tenants t ON t.id = m.tenant_id JOIN users u ON u.id = m.user_id
+      WHERE t.is_platform = 0 AND m.status = 'approved' AND m.user_id IS NOT t.created_by
+    UNION ALL
+    SELECT 'request', t.id, t.name, u.name, m.created_at FROM memberships m JOIN tenants t ON t.id = m.tenant_id JOIN users u ON u.id = m.user_id
+      WHERE t.is_platform = 0 AND m.status = 'pending'
+    ORDER BY at DESC LIMIT 30`)));
+  const tenantOf = (req) => get('SELECT * FROM tenants WHERE id = ? AND is_platform = 0', req.params.id) || (() => { throw fail(404, 'Organisation not found'); })();
+  // One organisation: its profile and members
+  base.get('/management/organisations/:id', mgmt, wrap((req) => {
+    const t = tenantOf(req), e = get('SELECT gst_number, state FROM organisations WHERE tenant_id = ? ORDER BY id LIMIT 1', t.id);
+    return {
+      organisation: { id: t.id, name: t.name, invite_code: t.invite_code, created_at: t.created_at, active: !!t.active, modules: tenantModules(t.modules),
+        gst_number: e?.gst_number || null, state: e?.state || null, creator: get('SELECT name, email FROM users WHERE id = ?', t.created_by) || null },
+      members: all(`SELECT u.id, u.name, u.email, u.active, m.role, m.status, m.created_at, m.decided_at, r.name AS user_type
+        FROM memberships m JOIN users u ON u.id = m.user_id LEFT JOIN roles r ON r.id = COALESCE(m.role_id, u.role_id) AND r.tenant_id = m.tenant_id
+        WHERE m.tenant_id = ? ORDER BY CASE m.status WHEN 'approved' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, m.role, u.name`, t.id),
+    };
+  }));
+  // Enable / disable modules and activate / deactivate
+  base.put('/management/organisations/:id', mgmt, wrap((req) => {
+    const t = tenantOf(req), b = req.body || {};
+    if (b.modules !== undefined) {
+      if (!Array.isArray(b.modules) || b.modules.some((m) => !MODULES[m])) throw fail(400, 'Unknown module');
+      if (!b.modules.length) throw fail(400, 'An organisation needs at least one module');
+      run('UPDATE tenants SET modules = ? WHERE id = ?', JSON.stringify(ALL_MODULES.filter((m) => b.modules.includes(m))), t.id);
+      logAct(req.user, 'update', 'organisations', t.id, `${t.name}: modules ${b.modules.map((m) => MODULES[m].label).join(', ')}`, t.id);
+    }
+    if (b.active !== undefined) {
+      run('UPDATE tenants SET active = ? WHERE id = ?', b.active ? 1 : 0, t.id);
+      logAct(req.user, b.active ? 'activate' : 'deactivate', 'organisations', t.id, `${t.name} ${b.active ? 'reactivated' : 'deactivated'} by management`, t.id);
+    }
+    const u = tenantOf(req);
+    return { id: u.id, modules: tenantModules(u.modules), active: !!u.active };
+  }));
+  // Permanently delete an organisation and everything it owns. User accounts stay (they can join or create another).
+  base.delete('/management/organisations/:id', mgmt, wrap((req) => {
+    const t = tenantOf(req);
+    if (String(req.body?.confirm || '').trim().toLowerCase() !== t.name.trim().toLowerCase()) throw fail(400, 'Type the organisation name to confirm');
+    deleteTenant(t.id);
+    console.log(`Organisation ${t.id} (${t.name}) deleted by management user ${req.user.email}`);
+    return { ok: true };
   }));
 
   /* ---------------- bank details (structured form over organisations.bank_details) */

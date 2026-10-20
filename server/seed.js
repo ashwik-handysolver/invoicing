@@ -10,6 +10,7 @@ const TEAM_MEMBER = [
   'payments.create', 'clients.view', 'clients.create', 'clients.edit', 'products.view', 'products.create', 'products.edit',
   'reminders.view', 'reminders.send', 'templates.view', 'templates.create', 'templates.edit',
   'recurring.view', 'recurring.create', 'recurring.edit', 'expenses.view', 'expenses.create', 'expenses.edit', 'gst.view', 'gst.export',
+  'tasks.view', 'tasks.create', 'tasks.edit', 'tasks.delete',
 ];
 // Every organisation has exactly two user types. (Platform "management" accounts are separate: users.is_management.)
 export const DEFAULT_MEMBER_ROLE = 'Team member';
@@ -44,8 +45,8 @@ export function createTenant(userId, name, org = {}) {
   return tx(() => {
     const tid = run('INSERT INTO tenants (name, invite_code, created_by) VALUES (?, ?, ?)', name, newInviteCode(), userId).lastInsertRowid;
     const roleId = createTenantDefaults(tid);
-    run("INSERT INTO memberships (tenant_id, user_id, role, status, decided_at, decided_by) VALUES (?, ?, 'admin', 'approved', CURRENT_TIMESTAMP, ?)", tid, userId, userId);
-    run('UPDATE users SET role_id = ? WHERE id = ?', roleId.Admin, userId);
+    run("INSERT INTO memberships (tenant_id, user_id, role, role_id, status, decided_at, decided_by) VALUES (?, ?, 'admin', ?, 'approved', CURRENT_TIMESTAMP, ?)", tid, userId, roleId.Admin, userId);
+    if (!get('SELECT role_id FROM users WHERE id = ?', userId)?.role_id) run('UPDATE users SET role_id = ? WHERE id = ?', roleId.Admin, userId); // legacy fallback only
     const keys = ['name', ...Object.keys(org).filter((k) => k !== 'name')];
     const vals = { ...org, name: org.name || name };
     const orgId = run(`INSERT INTO organisations (tenant_id, ${keys.join(',')}) VALUES (?, ${keys.map(() => '?').join(',')})`, tid, ...keys.map((k) => vals[k])).lastInsertRowid;
@@ -119,6 +120,16 @@ export function ensureManagement(hashPassword) {
   if (u) run('UPDATE users SET is_management = 1 WHERE id = ?', u.id);
   else run('INSERT INTO users (name, email, password_hash, is_management) VALUES (?, ?, ?, 1)', 'Management', email, hashPassword(process.env.MANAGEMENT_PASSWORD || 'manage123'));
   console.log(`Management login: ${email}${u ? '' : ' / ' + (process.env.MANAGEMENT_PASSWORD ? '(MANAGEMENT_PASSWORD)' : 'manage123')}`);
+}
+
+// Management accounts get their own workspace (an organisation they admin) so they can use Invoicing and Tasks too.
+// It is flagged is_platform so it never shows up among the customer organisations management controls.
+export function ensureManagementWorkspace() {
+  for (const u of all("SELECT id, name FROM users WHERE is_management = 1 AND id NOT IN (SELECT user_id FROM memberships WHERE status IN ('approved', 'pending'))")) {
+    const { tid } = createTenant(u.id, 'Management workspace');
+    run('UPDATE tenants SET is_platform = 1 WHERE id = ?', tid);
+    console.log(`Created management workspace for ${u.name}`);
+  }
 }
 
 // One-time: reduce every organisation to Admin + Team member. Users on any other role become Team members.

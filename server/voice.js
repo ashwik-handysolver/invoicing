@@ -5,8 +5,11 @@ import crypto from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenAI, ApiError as GeminiError } from '@google/genai';
 import { all, get, run, tx } from './db.js';
-import { r2 } from './calc.js';
+import { r2, calcInvoice } from './calc.js';
+import { MODULES, ALL_MODULES, tenantModules } from './modules.js';
+import { deleteTenant } from './orgs.js';
 import { logAct } from './activity.js';
+import { TASK_PRIORITIES, TASK_STATUSES, taskScope, assignable, assignablePeople, assignedToSql, isAssignee, withAssignees, setAssignees } from './tasks.js';
 
 // Provider: VOICE_PROVIDER=claude|gemini, or picked from whichever key is set (Claude first).
 const GEMINI_KEY = () => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -17,7 +20,8 @@ const GEMINI_MODELS = [...new Set([MODEL, 'gemini-flash-latest', 'gemini-flash-l
 const NOT_SET_UP = 'Voice is not set up: add GEMINI_API_KEY (free at aistudio.google.com) or ANTHROPIC_API_KEY on the server.';
 const STATUS = ['active', 'inactive', 'on_hold'];
 const PAGES = { dashboard: '#/dashboard', invoices: '#/invoices', payments: '#/payments', reminders: '#/reminders', clients: '#/clients',
-  products: '#/products', expenses: '#/expenses', gst: '#/gst', recurring: '#/recurring', settings: '#/settings', new_invoice: '#/invoices/new?type=tax' };
+  products: '#/products', expenses: '#/expenses', gst: '#/gst', recurring: '#/recurring', settings: '#/settings', tasks: '#/tasks', new_invoice: '#/invoices/new?type=tax',
+  management_dashboard: '#/management', organisations: '#/organisations' };
 const today = () => new Date().toISOString().slice(0, 10);
 // Language of one message: Devanagari -> Hindi; Roman with common Hindi words -> Hinglish; otherwise English.
 const HINGLISH = /\b(hai|hain|ho|kar|karo|kardo|kar do|karna|ka|ke|ki|ko|se|mein|pe|par|bhej|bhejo|bhejna|bhejdo|kya|kitna|kitne|kitni|baaki|baki|dikhao|kholo|batao|bata|wala|wale|aur|abhi|naya|nayi|sab|kuch|gaya|gayi|diya|liya|chahiye|nahi|haan|bhi|uska|uske|unka|mera|mujhe|hamara)\b/gi;
@@ -29,6 +33,8 @@ export const replyLang = (t) => {
 const inr = (n) => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
 const obj = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
+const ITEMS = { type: 'array', items: { type: 'object', properties: { product_id: { type: 'integer' }, description: { type: 'string' }, price: { type: 'number' }, quantity: { type: 'number' },
+  tax: { type: 'number', description: 'GST %' }, discount_percent: { type: 'number' } } } };
 const TOOLS = [
   { name: 'find_clients', description: 'Search clients of this organisation by name, contact person, mobile, email or GSTIN. Use before any client update to get the client_id. Empty query lists recent clients.',
     input_schema: obj({ query: { type: 'string' } }, ['query']) },
@@ -48,8 +54,35 @@ const TOOLS = [
   { name: 'record_payment', description: 'Record a payment received against a tax invoice (this is how an invoice becomes paid). Omit amount to pay the full balance. Needs invoice_id from find_invoices. The user confirms first.',
     input_schema: obj({ invoice_id: { type: 'integer' }, amount: { type: 'number' }, mode: { type: 'string', enum: ['UPI', 'Bank Transfer', 'Cash', 'Cheque', 'Card', 'Other'] },
       paid_on: { type: 'string', description: 'YYYY-MM-DD, default today' }, reference: { type: 'string' } }, ['invoice_id']) },
+  { name: 'find_tasks', description: 'Search tasks by title / description text, assignee name, status or priority. "mine" = assigned to the user. Use before update_task to get the task_id. Empty input lists open tasks.',
+    input_schema: obj({ query: { type: 'string' }, assignee: { type: 'string', description: 'person name, or "me"' }, status: { type: 'string', enum: [...TASK_STATUSES, 'open', 'overdue', 'any'] }, priority: { type: 'string', enum: TASK_PRIORITIES } }) },
+  { name: 'find_people', description: 'List the team members tasks can be assigned to (id and name).', input_schema: obj({ query: { type: 'string' } }) },
+  { name: 'create_task', description: 'Create a task and optionally assign it to one or more team members (assignees = user ids from find_people). The user becomes the assigner. The user confirms before it is saved.',
+    input_schema: obj({ title: { type: 'string' }, description: { type: 'string' }, due_date: { type: 'string', description: 'YYYY-MM-DD' }, priority: { type: 'string', enum: TASK_PRIORITIES },
+      status: { type: 'string', enum: TASK_STATUSES }, assignees: { type: 'array', items: { type: 'integer' } } }, ['title']) },
+  { name: 'update_task', description: 'Change a task. Only the person who assigned it (or an admin) can change anything; the assignee can only change status. Needs task_id from find_tasks. assignees replaces the whole list (pass [] to unassign everyone); add_assignees / remove_assignees change it. The user confirms first.',
+    input_schema: obj({ task_id: { type: 'integer' }, title: { type: 'string' }, description: { type: 'string' }, due_date: { type: 'string', description: 'YYYY-MM-DD' }, priority: { type: 'string', enum: TASK_PRIORITIES },
+      status: { type: 'string', enum: TASK_STATUSES }, assignees: { type: 'array', items: { type: 'integer' } }, add_assignees: { type: 'array', items: { type: 'integer' } },
+      remove_assignees: { type: 'array', items: { type: 'integer' } } }, ['task_id']) },
+  { name: 'find_products', description: 'List saved services / products (name, price, GST %, SAC) to use as invoice lines. Empty query lists them all.', input_schema: obj({ query: { type: 'string' } }) },
+  { name: 'get_invoice', description: 'Full details of one invoice including its line items. Use before update_invoice.', input_schema: obj({ invoice_id: { type: 'integer' } }, ['invoice_id']) },
+  { name: 'create_invoice', description: 'Create a tax invoice (default) or proforma for a client. Needs client_id from find_clients. Each item: product_id from find_products (price / GST / description come from it unless given) or a description with price. The user confirms first.',
+    input_schema: obj({ client_id: { type: 'integer' }, invoice_type: { type: 'string', enum: ['tax', 'proforma'] }, invoice_date: { type: 'string', description: 'YYYY-MM-DD, default today' }, due_date: { type: 'string', description: 'YYYY-MM-DD' },
+      gst_applied: { type: 'boolean', description: 'false = invoice without GST' }, notes: { type: 'string' }, items: ITEMS }, ['client_id', 'items']) },
+  { name: 'update_invoice', description: 'Edit an invoice: dates, notes, GST on/off, or replace its line items (give the full new list). Needs invoice_id. The user confirms first.',
+    input_schema: obj({ invoice_id: { type: 'integer' }, invoice_date: { type: 'string' }, due_date: { type: 'string' }, gst_applied: { type: 'boolean' }, notes: { type: 'string' }, items: ITEMS }, ['invoice_id']) },
+  { name: 'delete_invoice', description: 'Delete an invoice permanently. Needs invoice_id. The user confirms first.', input_schema: obj({ invoice_id: { type: 'integer' } }, ['invoice_id']) },
+  { name: 'delete_client', description: 'Delete a client. Not possible while the client has invoices (mark them inactive with update_client instead). The user confirms first.', input_schema: obj({ client_id: { type: 'integer' } }, ['client_id']) },
+  { name: 'find_organisations', description: 'Platform management only: list customer organisations with status (active / deactivated), modules and member counts.', input_schema: obj({ query: { type: 'string' } }) },
+  { name: 'set_organisation_status', description: 'Platform management only: deactivate (active false) or reactivate (active true) an organisation. Needs organisation_id from find_organisations. The user confirms first.',
+    input_schema: obj({ organisation_id: { type: 'integer' }, active: { type: 'boolean' } }, ['organisation_id', 'active']) },
+  { name: 'set_organisation_modules', description: 'Platform management only: choose which modules an organisation can use (at least one). The user confirms first.',
+    input_schema: obj({ organisation_id: { type: 'integer' }, modules: { type: 'array', items: { type: 'string', enum: ALL_MODULES } } }, ['organisation_id', 'modules']) },
+  { name: 'delete_organisation', description: 'Platform management only: permanently delete an organisation and all its data. Needs organisation_id. The user confirms first.', input_schema: obj({ organisation_id: { type: 'integer' } }, ['organisation_id']) },
 ]; // inputs are validated in plan()/read() before anything runs
-const WRITE = new Set(['update_client', 'create_client', 'record_payment']);
+const WRITE = new Set(['update_client', 'create_client', 'record_payment', 'create_task', 'update_task', 'create_invoice', 'update_invoice', 'delete_invoice', 'delete_client',
+  'set_organisation_status', 'set_organisation_modules', 'delete_organisation']);
+const ST_LABEL = { todo: 'to do', in_progress: 'in progress', done: 'done' };
 
 const SYSTEM = `You are the voice assistant inside an Indian GST invoicing app. The user speaks Hindi, English or a mix (Hinglish); speech-to-text may mis-spell names, so search loosely and pick the closest match.
 Rules:
@@ -59,11 +92,14 @@ Rules:
 - If several records match and you cannot tell which one, ask a short question listing them instead of guessing.
 - To email or WhatsApp an invoice or reminder, use compose_message: the app opens a filled-in draft and the user sends it. Never say you cannot send email.
 - If the client has no email (or mobile for WhatsApp) saved, do not send the user to another page: ask for it in one short question. When they give it, call update_client with that email/mobile and then_compose, so it is saved and the draft opens as soon as they confirm.
+- Tasks: statuses are todo, in_progress, done; priorities high, medium, low. Turn relative dates ("kal", "next Friday") into YYYY-MM-DD using today's date. To assign, look the person up with find_people.
+- Invoices: find the client (and products for the lines) first, then create_invoice. To edit, get_invoice first and pass the full new item list if lines change.
+- Organisation tools (find_organisations, set_organisation_status, set_organisation_modules, delete_organisation) are for platform management only; they never expose an organisation's business data.
 - If no tool can do what was asked, say so briefly.
 - Reply in the language named in the "Reply language" line, which describes the user's latest message only. Earlier turns do not change it. Replies are spoken aloud: one or two short sentences, amounts like "₹45,000", no markdown or lists.
 Latency-sensitive; begin your visible answer immediately.`;
 
-export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState }) {
+export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState, saveInvoice }) {
   let client, gemini;
   const anthropic = () => (client ||= new Anthropic());
   const google = () => {
@@ -118,6 +154,51 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
     },
   };
 
+  Object.assign(read, {
+    find_tasks(u, { query, assignee, status, priority }) {
+      need(u, 'tasks.view');
+      const v = taskScope(u), w = ['t.tenant_id = ?', v.sql], p = [u.tid, ...v.params];
+      if (query) { w.push('(t.title LIKE ? OR t.description LIKE ?)'); p.push(`%${query}%`, `%${query}%`); }
+      if (assignee && /^(me|mine|my|mera|mujhe)$/i.test(assignee.trim())) { w.push(assignedToSql()); p.push(u.id); }
+      else if (assignee) { w.push('EXISTS (SELECT 1 FROM task_assignees a JOIN users au ON au.id = a.user_id WHERE a.task_id = t.id AND au.name LIKE ?)'); p.push(`%${assignee}%`); }
+      if (status === 'overdue') { w.push("t.status != 'done' AND t.due_date < ?"); p.push(today()); }
+      else if (!status || status === 'open') w.push("t.status != 'done'");
+      else if (status !== 'any') { w.push('t.status = ?'); p.push(status); }
+      if (priority) { w.push('t.priority = ?'); p.push(priority); }
+      return withAssignees(all(`SELECT t.id, t.title, t.description, t.due_date, t.priority, t.status, ub.name AS assigned_by,
+          (t.assigned_by = ? OR ?) AS you_can_edit_all, ${assignedToSql()} AS assigned_to_you
+        FROM tasks t LEFT JOIN users ub ON ub.id = t.assigned_by
+        WHERE ${w.join(' AND ')} ORDER BY t.due_date IS NULL, t.due_date LIMIT 10`, u.id, u.isAdmin ? 1 : 0, u.id, ...p))
+        .map(({ assignees, ...t }) => ({ ...t, assigned_to: assignees.map((a) => a.name) }));
+    },
+    find_people(u, { query }) {
+      need(u, 'tasks.view');
+      return assignablePeople(u, 'AND u.name LIKE ?', `%${String(query || '').trim()}%`);
+    },
+  });
+  const taskOf = (u, id) => { const v = taskScope(u); return get(`SELECT t.* FROM tasks t WHERE t.id = ? AND t.tenant_id = ? AND ${v.sql}`, id, u.tid, ...v.params) || (() => { throw fail(404, 'Task not found'); })(); };
+  const personOf = (u, id) => (assignable(u, id) && get('SELECT id, name FROM users WHERE id = ?', id))
+    || (() => { throw fail(400, u.isAdmin ? 'That person is not in this organisation. Use find_people.' : 'Team members can only assign tasks to other team members, not admins. Use find_people.'); })();
+  // same fields + rules as the Tasks page (server/tasks.js)
+  const taskFields = (u, f, current = []) => {
+    const o = {};
+    for (const k of ['title', 'description']) if (f[k] != null && String(f[k]).trim()) o[k] = String(f[k]).trim();
+    if (f.due_date != null) { if (!/^\d{4}-\d{2}-\d{2}$/.test(f.due_date)) throw fail(400, 'Due date must be YYYY-MM-DD'); o.due_date = f.due_date; }
+    if (f.priority != null) { if (!TASK_PRIORITIES.includes(f.priority)) throw fail(400, 'Priority must be high, medium or low'); o.priority = f.priority; }
+    if (f.status != null) { if (!TASK_STATUSES.includes(f.status)) throw fail(400, 'Status must be todo, in_progress or done'); o.status = f.status; }
+    let list = Array.isArray(f.assignees) ? f.assignees.map(Number) : null;
+    if (f.add_assignees?.length || f.remove_assignees?.length) list = [...(list || current), ...(f.add_assignees || []).map(Number)].filter((id) => !(f.remove_assignees || []).map(Number).includes(id));
+    if (list) o.assignees = [...new Set(list)].map((id) => personOf(u, id).id);
+    return o;
+  };
+  const describe = (u, o) => [o.title && `"${o.title}"`, o.due_date && `due ${o.due_date.split('-').reverse().join('-')}`, o.priority && `${o.priority} priority`,
+    o.status && ST_LABEL[o.status], o.assignees && (o.assignees.length ? `assigned to ${o.assignees.map((id) => (id === u.id ? 'you' : personOf(u, id).name)).join(', ')}` : 'unassigned')].filter(Boolean).join(', ');
+  const taskWrite = (u, t, o) => {
+    if (u.isAdmin || t.assigned_by === u.id) return;
+    if (!isAssignee(t.id, u.id)) throw fail(403, 'Only the person who assigned this task can change it');
+    if (Object.keys(o).some((k) => k !== 'status')) throw fail(403, 'On a task assigned to you, you can only change its status');
+  };
+
   /* ---------- write tools: plan (validate + describe) now, execute after confirmation ---------- */
   const plan = {
     update_client(u, { client_id, then_compose, ...f }) {
@@ -152,7 +233,44 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
         summary: `Record ${inr(amt)} ${mode ? `via ${mode} ` : ''}on ${inv.invoice_number} (${inv.client_name})${amt >= inv.balance_amount - 0.005 ? ' — marks it paid' : ''}` };
     },
   };
+  Object.assign(plan, {
+    create_task(u, f) {
+      need(u, 'tasks.create');
+      const o = { priority: 'medium', status: 'todo', ...taskFields(u, f) };
+      if (!o.title) throw fail(400, 'Task title is required');
+      return { input: o, summary: `Create task ${describe(u, o)}` };
+    },
+    update_task(u, { task_id, ...f }) {
+      need(u, 'tasks.view');
+      const t = taskOf(u, task_id);
+      taskWrite(u, t, Object.fromEntries(Object.entries(f).filter(([, v]) => v != null))); // permission first, so the reason is right
+      const o = taskFields(u, f, all('SELECT user_id FROM task_assignees WHERE task_id = ?', t.id).map((r) => r.user_id));
+      if (!Object.keys(o).length) throw fail(400, 'Nothing to change');
+      taskWrite(u, t, o);
+      return { input: { task_id: t.id, ...o }, summary: `Update task "${t.title}": ${describe(u, { ...o, title: o.title && o.title !== t.title ? o.title : undefined })}` };
+    },
+  });
   const exec = {
+    create_task(u, o) {
+      need(u, 'tasks.create');
+      const { assignees = [], ...f } = o;
+      assignees.forEach((id) => personOf(u, id));
+      const keys = Object.keys(f);
+      const id = run(`INSERT INTO tasks (tenant_id, assigned_by, ${keys.join(',')}) VALUES (?, ?, ${keys.map(() => '?').join(',')})`, u.tid, u.id, ...keys.map((k) => f[k])).lastInsertRowid;
+      setAssignees(id, assignees);
+      logAct(u, 'create', 'tasks', id, `${o.title} (voice)`);
+      return { refresh: true, open: '#/tasks' };
+    },
+    update_task(u, { task_id, ...o }) {
+      need(u, 'tasks.view');
+      const t = taskOf(u, task_id);
+      taskWrite(u, t, o);
+      const { assignees, ...f } = o, keys = Object.keys(f);
+      if (keys.length) run(`UPDATE tasks SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ? AND tenant_id = ?`, ...keys.map((k) => f[k]), t.id, u.tid);
+      if (assignees) { assignees.forEach((id) => personOf(u, id)); setAssignees(t.id, assignees); }
+      logAct(u, 'update', 'tasks', t.id, `${o.title || t.title} (voice)`);
+      return { refresh: true, open: '#/tasks' };
+    },
     update_client(u, { client_id, then_compose, ...ch }) {
       need(u, 'clients.edit');
       const c = clientOf(u, client_id);
@@ -184,6 +302,160 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
     },
   };
 
+  /* ---------- invoices, products, clients (same rules as the normal pages) ---------- */
+  const primaryOrg = (u) => get('SELECT * FROM organisations WHERE tenant_id = ? ORDER BY id LIMIT 1', u.tid) || (() => { throw fail(400, 'Set up your organisation details in Settings first'); })();
+  const ymd = (v, label) => { if (v == null || v === '') return undefined; if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) throw fail(400, `${label} must be YYYY-MM-DD`); return v; };
+  // AI line items -> invoice lines, filling price / GST / description from a saved product when one is named
+  const lines = (u, items) => {
+    if (!Array.isArray(items) || !items.length) throw fail(400, 'Add at least one line item');
+    return items.map((it) => {
+      const p = it.product_id ? get('SELECT * FROM service_products WHERE id = ? AND tenant_id = ?', it.product_id, u.tid) || (() => { throw fail(400, 'Product not found. Use find_products.'); })() : null;
+      const l = { service_product_id: p?.id || null, sac_number: p?.sac_number || '', description: (it.description || p?.description || p?.name || '').trim(),
+        price: it.price ?? p?.price, quantity: it.quantity ?? 1, tax: it.tax ?? p?.tax ?? 18, discount_percent: it.discount_percent || 0 };
+      if (!l.description) throw fail(400, 'Every line needs a description or product');
+      if (!(+l.price >= 0) || l.price === undefined) throw fail(400, `Price missing for "${l.description}"`);
+      if (!(+l.quantity > 0)) throw fail(400, `Quantity must be more than 0 for "${l.description}"`);
+      return l;
+    });
+  };
+  const preview = (u, org, client, items, gst) => {
+    const intra = !!org.state_code && org.state_code === client.state_code;
+    return calcInvoice({ items: gst ? items : items.map((i) => ({ ...i, tax: 0 })), intra }).totals;
+  };
+  Object.assign(read, {
+    find_products(u, { query }) {
+      need(u, 'products.view');
+      return all('SELECT id, name, price, tax, sac_number FROM service_products WHERE tenant_id = ? AND name LIKE ? ORDER BY name LIMIT 15', u.tid, `%${String(query || '').trim()}%`);
+    },
+    get_invoice(u, { invoice_id }) {
+      need(u, 'invoices.view');
+      const inv = invoiceOf(u, invoice_id);
+      return { id: inv.id, invoice_number: inv.invoice_number, invoice_type: inv.invoice_type, invoice_date: inv.invoice_date, due_date: inv.due_date, client_id: inv.client_id, client_name: inv.client_name,
+        gst_applied: !!inv.gst_applied, notes: inv.notes, total: inv.net_amount, paid: inv.paid_amount, balance: inv.balance_amount, status: inv.payment_status,
+        items: all('SELECT service_product_id AS product_id, description, price, quantity, tax, discount_percent FROM invoice_items WHERE invoice_id = ? ORDER BY position', inv.id) };
+    },
+  });
+  Object.assign(plan, {
+    create_invoice(u, f) {
+      need(u, 'invoices.create');
+      const c = clientOf(u, f.client_id), org = primaryOrg(u), type = f.invoice_type === 'proforma' ? 'proforma' : 'tax', gst = f.gst_applied !== false;
+      const items = lines(u, f.items), t = preview(u, org, c, items, gst);
+      const input = { client_id: c.id, invoice_type: type, invoice_date: ymd(f.invoice_date, 'Invoice date') || today(), due_date: ymd(f.due_date, 'Due date') || null, gst_applied: gst, notes: f.notes || null, items };
+      return { input, summary: `Create ${type === 'tax' ? 'tax invoice' : 'proforma'} for ${c.name}: ${items.length} line${items.length > 1 ? 's' : ''}, total ${inr(t.total)}${gst ? '' : ' (no GST)'}${input.due_date ? `, due ${input.due_date.split('-').reverse().join('-')}` : ''}` };
+    },
+    update_invoice(u, { invoice_id, ...f }) {
+      need(u, 'invoices.edit');
+      const inv = invoiceOf(u, invoice_id), changes = {};
+      if (f.invoice_date !== undefined) changes.invoice_date = ymd(f.invoice_date, 'Invoice date');
+      if (f.due_date !== undefined) changes.due_date = ymd(f.due_date, 'Due date');
+      if (f.notes !== undefined) changes.notes = f.notes;
+      if (f.gst_applied !== undefined) changes.gst_applied = !!f.gst_applied;
+      if (f.items !== undefined) changes.items = lines(u, f.items);
+      if (!Object.keys(changes).length) throw fail(400, 'Nothing to change');
+      const what = [changes.items && `${changes.items.length} line item(s)`, changes.invoice_date && `date ${changes.invoice_date}`, changes.due_date && `due ${changes.due_date}`,
+        'gst_applied' in changes && (changes.gst_applied ? 'with GST' : 'without GST'), changes.notes !== undefined && 'notes'].filter(Boolean).join(', ');
+      return { input: { invoice_id: inv.id, ...changes }, summary: `Update ${inv.invoice_number} (${inv.client_name}): ${what}` };
+    },
+    delete_invoice(u, { invoice_id }) {
+      need(u, 'invoices.delete');
+      const inv = invoiceOf(u, invoice_id);
+      return { input: { invoice_id: inv.id }, summary: `Delete ${inv.invoice_number} (${inv.client_name}, ${inr(inv.net_amount)})${inv.paid_amount > 0 ? ' and its recorded payments' : ''}` };
+    },
+    delete_client(u, { client_id }) {
+      need(u, 'clients.delete');
+      const c = clientOf(u, client_id), n = get('SELECT COUNT(*) AS n FROM invoices WHERE client_id = ? AND tenant_id = ?', c.id, u.tid).n;
+      if (n) throw fail(400, `${c.name} has ${n} invoice(s), so it can't be deleted. Mark it inactive instead.`);
+      return { input: { client_id: c.id }, summary: `Delete client ${c.name}` };
+    },
+  });
+  Object.assign(exec, {
+    create_invoice(u, f) {
+      need(u, 'invoices.create');
+      const id = saveInvoice(u.tid, { ...f, organisation_id: primaryOrg(u).id }, u.id);
+      const i = get('SELECT invoice_number, client_name, total_amount FROM invoices WHERE id = ?', id);
+      logAct(u, 'create', 'invoice', id, `${i.invoice_number} for ${i.client_name} (₹${i.total_amount}) (voice)`);
+      return { refresh: true, open: `#/invoices/${id}` };
+    },
+    update_invoice(u, { invoice_id, ...ch }) {
+      need(u, 'invoices.edit');
+      const inv = invoiceOf(u, invoice_id);
+      const items = ch.items || all('SELECT service_product_id, sac_number, description, price, quantity, tax, discount_percent FROM invoice_items WHERE invoice_id = ? ORDER BY position', inv.id);
+      saveInvoice(u.tid, { organisation_id: inv.organisation_id, client_id: inv.client_id, invoice_date: ch.invoice_date ?? inv.invoice_date, due_date: 'due_date' in ch ? ch.due_date : inv.due_date,
+        notes: 'notes' in ch ? ch.notes : inv.notes, gst_applied: 'gst_applied' in ch ? ch.gst_applied : !!inv.gst_applied, tds_percent: inv.tds_percent,
+        pay_qr: inv.pay_qr, pay_upi: inv.pay_upi, pay_bank: inv.pay_bank, items }, u.id, inv.id);
+      logAct(u, 'update', 'invoice', inv.id, `${inv.invoice_number} (voice)`);
+      return { refresh: true, open: `#/invoices/${inv.id}` };
+    },
+    delete_invoice(u, { invoice_id }) {
+      need(u, 'invoices.delete');
+      const inv = invoiceOf(u, invoice_id);
+      if (inv.converted_from_id) run('UPDATE invoices SET converted_to_id = NULL WHERE id = ?', inv.converted_from_id);
+      run('DELETE FROM invoices WHERE id = ?', inv.id);
+      logAct(u, 'delete', 'invoice', inv.id, `${inv.invoice_number} (voice)`);
+      return { refresh: true, open: '#/invoices' };
+    },
+    delete_client(u, { client_id }) {
+      need(u, 'clients.delete');
+      const c = clientOf(u, client_id);
+      run('DELETE FROM clients WHERE id = ? AND tenant_id = ?', c.id, u.tid);
+      logAct(u, 'delete', 'clients', c.id, `${c.name} (voice)`);
+      return { refresh: true };
+    },
+  });
+
+  /* ---------- platform management: organisations (no business data, same as the Organisations page) ---------- */
+  const mgmtOnly = (u) => { if (!u.isManagement) throw fail(403, 'Only platform management can manage organisations'); };
+  const orgOf = (id) => get('SELECT * FROM tenants WHERE id = ? AND is_platform = 0', id) || (() => { throw fail(404, 'Organisation not found. Use find_organisations.'); })();
+  read.find_organisations = (u, { query }) => {
+    mgmtOnly(u);
+    return all(`SELECT t.id, t.name, t.active, t.modules, (SELECT COUNT(*) FROM memberships WHERE tenant_id = t.id AND status = 'approved') AS members
+      FROM tenants t WHERE t.is_platform = 0 AND t.name LIKE ? ORDER BY t.name LIMIT 20`, `%${String(query || '').trim()}%`)
+      .map((t) => ({ ...t, active: !!t.active, modules: tenantModules(t.modules) }));
+  };
+  Object.assign(plan, {
+    set_organisation_status(u, { organisation_id, active }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      if (!!t.active === !!active) throw fail(400, `${t.name} is already ${active ? 'active' : 'deactivated'}`);
+      return { input: { organisation_id: t.id, active: !!active }, summary: `${active ? 'Reactivate' : 'Deactivate'} ${t.name}${active ? '' : ' (its members lose access until reactivated; no data is deleted)'}` };
+    },
+    set_organisation_modules(u, { organisation_id, modules }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      if (!Array.isArray(modules) || !modules.length || modules.some((m) => !MODULES[m])) throw fail(400, `Pick at least one of: ${ALL_MODULES.join(', ')}`);
+      const m = ALL_MODULES.filter((x) => modules.includes(x));
+      return { input: { organisation_id: t.id, modules: m }, summary: `Set ${t.name} modules to ${m.map((x) => MODULES[x].label).join(' and ')}` };
+    },
+    delete_organisation(u, { organisation_id }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      return { input: { organisation_id: t.id }, summary: `Permanently delete ${t.name} and all its data. This cannot be undone` };
+    },
+  });
+  Object.assign(exec, {
+    set_organisation_status(u, { organisation_id, active }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      run('UPDATE tenants SET active = ? WHERE id = ?', active ? 1 : 0, t.id);
+      logAct(u, active ? 'activate' : 'deactivate', 'organisations', t.id, `${t.name} ${active ? 'reactivated' : 'deactivated'} by management (voice)`, t.id);
+      return { refresh: true, open: '#/organisations' };
+    },
+    set_organisation_modules(u, { organisation_id, modules }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      run('UPDATE tenants SET modules = ? WHERE id = ?', JSON.stringify(modules), t.id);
+      logAct(u, 'update', 'organisations', t.id, `${t.name}: modules ${modules.join(', ')} (voice)`, t.id);
+      return { refresh: true, open: '#/organisations' };
+    },
+    delete_organisation(u, { organisation_id }) {
+      mgmtOnly(u);
+      const t = orgOf(organisation_id);
+      deleteTenant(t.id);
+      console.log(`Organisation ${t.id} (${t.name}) deleted by management user ${u.email} (voice)`);
+      return { refresh: true, open: '#/organisations' };
+    },
+  });
+
   // Draft an email / WhatsApp message: validated here, opened in the browser through the app's normal "Send" window.
   function draftFor(u, { kind, channel, invoice_id, client_id }) {
     need(u, 'reminders.send');
@@ -214,7 +486,7 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
     while (history.length && history[0].role !== 'user') history.shift();
     const out = { reply: '', pending: null, navigate: null, compose: null };
     try {
-      const system = `${SYSTEM}\nReply language: ${replyLang(text)}.`;
+      const system = `${SYSTEM}\nToday: ${today()}. You are talking to ${u.name}.\nReply language: ${replyLang(text)}.`;
       await (PROVIDER === 'gemini' ? runGemini : runClaude)(u, history, text, out, system);
       if (!out.reply) out.reply = out.pending ? out.pending.summary : out.compose ? 'Opening the draft.' : out.navigate ? 'Opening it.' : 'Done.';
       res.json(out);

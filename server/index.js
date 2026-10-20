@@ -5,12 +5,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { all, get, run, tx } from './db.js';
 import { calcInvoice, financialYear, paymentStatus, r2, stateCode, STATES } from './calc.js';
-import { seedIfEmpty, ensureManagement, normalizeRoles } from './seed.js';
+import { seedIfEmpty, ensureManagement, ensureManagementWorkspace, normalizeRoles } from './seed.js';
 import qrcode from 'qrcode-generator';
 import { logAct } from './activity.js';
 import { ensureDefaults, ensureRolePerms, init as initFeatures, registerGst } from './features.js';
 import { registerOrgs } from './orgs.js';
 import { registerVoice } from './voice.js';
+import { registerTasks, ensureTaskPerms } from './tasks.js';
+import { tenantModules, permsForModules } from './modules.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -33,6 +35,7 @@ export const PERMISSIONS = {
   settings: ['view', 'edit'],
   users: ['view', 'create', 'edit', 'delete'],
   roles: ['view', 'create', 'edit', 'delete'],
+  tasks: ['view', 'create', 'edit', 'delete'],
 };
 const ALL_KEYS = Object.entries(PERMISSIONS).flatMap(([m, acts]) => acts.map((a) => `${m}.${a}`));
 
@@ -65,16 +68,19 @@ function auth(req, res, next) {
   if (!row || !row.active || Date.now() - new Date(row.sess_at + 'Z').getTime() > SESSION_DAYS * 864e5) {
     return res.status(401).json({ error: 'Not signed in' });
   }
-  const m = get(`SELECT m.tenant_id, m.role, m.status, m.created_at, m.decided_at, t.name AS tenant_name
+  const m = get(`SELECT m.tenant_id, m.role, m.role_id, m.status, m.created_at, m.decided_at, t.name AS tenant_name, t.modules, t.active AS tenant_active
        FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ?
        ORDER BY CASE m.status WHEN 'approved' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, m.id DESC LIMIT 1`, row.id);
+  // a deactivated organisation behaves like no membership: its members are shown a "deactivated" screen
+  if (m?.status === 'approved' && !m.tenant_active) m.status = 'deactivated';
   const approved = m?.status === 'approved';
-  const role = approved ? get('SELECT name, permissions FROM roles WHERE id = ? AND tenant_id = ?', row.role_id, m.tenant_id) : null;
-  const perms = role ? JSON.parse(role.permissions) : [];
+  const role = approved ? get('SELECT name, permissions FROM roles WHERE id = ? AND tenant_id = ?', m.role_id ?? row.role_id, m.tenant_id) : null;
+  const modules = approved ? tenantModules(m.modules) : [];
+  const perms = role ? permsForModules(JSON.parse(role.permissions), modules, ALL_KEYS) : [];
   if (row.is_management) perms.push('management.view');
   req.user = { id: row.id, name: row.name, email: row.email, role: role?.name || (row.is_management ? 'Management' : null), perms, token, isManagement: !!row.is_management,
     tid: approved ? m.tenant_id : null, isAdmin: approved && m.role === 'admin',
-    membership: m ? { status: m.status, role: m.role, organisation: m.tenant_name, requested_at: m.created_at, decided_at: m.decided_at } : null };
+    modules, membership: m ? { status: m.status, role: m.role, organisation: m.tenant_name, requested_at: m.created_at, decided_at: m.decided_at } : null };
   next();
 }
 // Every route on `api` needs an approved membership; queries there are scoped with req.user.tid.
@@ -124,6 +130,29 @@ base.post('/logout', wrap((req) => { run('DELETE FROM sessions WHERE token = ?',
 base.get('/me', wrap((req) => {
   const { token, tid, ...user } = req.user;
   return { user };
+}));
+// Any signed-in user: change your own name, email or password. Needs your current password; a new password signs out your other sessions.
+base.put('/account', wrap((req) => {
+  const b = req.body || {}, u = get('SELECT * FROM users WHERE id = ?', req.user.id);
+  if (!checkPassword(String(b.current_password || ''), u.password_hash)) throw fail(400, 'Current password is incorrect');
+  const o = {};
+  if (b.name !== undefined) { o.name = String(b.name).trim(); if (!o.name) throw fail(400, 'Name is required'); }
+  if (b.email !== undefined) {
+    o.email = String(b.email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(o.email)) throw fail(400, 'Enter a valid email address');
+    if (get('SELECT 1 AS x FROM users WHERE email = ? COLLATE NOCASE AND id != ?', o.email, u.id)) throw fail(409, 'That email is already used by another account');
+  }
+  if (b.new_password) {
+    const pw = String(b.new_password);
+    if (pw.length < 8 || !/[A-Za-z]/.test(pw) || !/\d/.test(pw)) throw fail(400, 'New password must be at least 8 characters with a letter and a number');
+    o.password_hash = hashPassword(pw);
+  }
+  const keys = Object.keys(o);
+  if (!keys.length) throw fail(400, 'Nothing to change');
+  run(`UPDATE users SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => o[k]), u.id);
+  if (o.password_hash) run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token);
+  if (req.user.tid) logAct(req.user, 'update', 'user', u.id, `${req.user.name} updated their ${[o.name && 'name', o.email && 'email', o.password_hash && 'password'].filter(Boolean).join(', ')}`);
+  return { ok: true, user: { name: o.name || u.name, email: o.email || u.email } };
 }));
 registerOrgs({ app, base, wrap, fail, hashPassword, checkPassword, newSession, hasPerm });
 app.use('/api', base);
@@ -219,6 +248,7 @@ const syncTenantName = (req, row) => {
 crud('organisations', 'organisations', ['name', 'address', 'gst_number', 'pan_number', 'email', 'contact', 'bank_details', 'logo', 'signature', 'qr_image', 'footer_note', 'terms', 'upi_id', 'state', 'state_code'], { perm: 'settings', write: 'edit', order: 'name', beforeSave: checkOrg, afterSave: syncTenantName });
 crud('cc-emails', 'email_notify', ['email'], { perm: 'settings', write: 'edit', order: 'email' });
 
+
 /* ---------------------------------------------------------------- roles & users */
 // User types are fixed per organisation (Admin, Team member): roles can be listed, not created, edited or deleted.
 api.use('/roles', (req, res, next) => (req.method === 'GET' ? next() : res.status(400).json({ error: 'User types are fixed: Admin and Team member.' })));
@@ -248,13 +278,13 @@ api.delete('/roles/:id', need('roles.delete'), wrap((req) => {
   const role = get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
   if (!role) throw fail(404, 'Not found');
   if (JSON.parse(role.permissions).includes('*')) throw fail(400, 'The Admin role cannot be deleted');
-  if (get('SELECT 1 AS x FROM users WHERE role_id = ?', role.id)) throw fail(409, 'This role is assigned to users. Move them to another role first.');
+  if (get('SELECT 1 AS x FROM memberships WHERE role_id = ?', role.id)) throw fail(409, 'This role is assigned to users. Move them to another role first.');
   run('DELETE FROM roles WHERE id = ?', role.id);
   return { ok: true };
 }));
 
-const userRow = `SELECT u.id, u.name, u.email, u.active, u.role_id, r.name AS role, m.role AS membership_role
-  FROM memberships m JOIN users u ON u.id = m.user_id LEFT JOIN roles r ON r.id = u.role_id WHERE m.tenant_id = ? AND m.status = 'approved'`;
+const userRow = `SELECT u.id, u.name, u.email, u.active, COALESCE(m.role_id, u.role_id) AS role_id, r.name AS role, m.role AS membership_role
+  FROM memberships m JOIN users u ON u.id = m.user_id LEFT JOIN roles r ON r.id = COALESCE(m.role_id, u.role_id) AND r.tenant_id = m.tenant_id WHERE m.tenant_id = ? AND m.status = 'approved'`;
 const memberOf = (req) => get(`${userRow} AND u.id = ?`, req.user.tid, req.params.id) || (() => { throw fail(404, 'Not found'); })();
 const adminCount = (tid) => get("SELECT COUNT(*) AS n FROM memberships WHERE tenant_id = ? AND status = 'approved' AND role = 'admin'", tid).n;
 api.get('/users', need('users.view'), wrap((req) => all(`${userRow} ORDER BY u.name`, req.user.tid)));
@@ -267,7 +297,7 @@ api.post('/users', need('users.create'), wrap((req) => {
   if (get('SELECT 1 AS x FROM users WHERE email = ?', email.trim())) throw fail(409, 'This email already has an account. Ask them to join with your organisation code.');
   const id = tx(() => {
     const uid = run('INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)', name.trim(), email.trim().toLowerCase(), hashPassword(password), role.id).lastInsertRowid;
-    run("INSERT INTO memberships (tenant_id, user_id, role, status, decided_at, decided_by) VALUES (?, ?, ?, 'approved', CURRENT_TIMESTAMP, ?)", req.user.tid, uid, role.admin ? 'admin' : 'member', req.user.id);
+    run("INSERT INTO memberships (tenant_id, user_id, role, role_id, status, decided_at, decided_by) VALUES (?, ?, ?, ?, 'approved', CURRENT_TIMESTAMP, ?)", req.user.tid, uid, role.admin ? 'admin' : 'member', role.id, req.user.id);
     return uid;
   });
   logAct(req.user, 'create', 'user', id, email);
@@ -284,10 +314,10 @@ api.put('/users/:id', need('users.edit'), wrap((req) => {
   if (role?.admin && !req.user.isAdmin) throw fail(403, 'Only admins can make someone an admin');
   if (role && !role.admin && u.membership_role === 'admin' && adminCount(req.user.tid) <= 1) throw fail(400, 'Your organisation needs at least one admin');
   tx(() => {
-    run('UPDATE users SET name = ?, email = ?, role_id = ?, active = ?, password_hash = ? WHERE id = ?',
-      (name || cur.name).trim(), (email || cur.email).trim().toLowerCase(), role ? role.id : cur.role_id,
+    run('UPDATE users SET name = ?, email = ?, active = ?, password_hash = ? WHERE id = ?',
+      (name || cur.name).trim(), (email || cur.email).trim().toLowerCase(),
       active === undefined ? cur.active : +!!active, password ? hashPassword(password) : cur.password_hash, u.id);
-    if (role) run('UPDATE memberships SET role = ? WHERE user_id = ? AND tenant_id = ?', role.admin ? 'admin' : 'member', u.id, req.user.tid);
+    if (role) run('UPDATE memberships SET role = ?, role_id = ? WHERE user_id = ? AND tenant_id = ?', role.admin ? 'admin' : 'member', role.id, u.id, req.user.tid);
   });
   logAct(req.user, 'update', 'user', u.id, u.email);
   if (password || active === false || active === 0) run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token);
@@ -696,12 +726,15 @@ app.use(express.static(path.join(__dirname, '..', 'public'), { setHeaders: (res)
 
 seedIfEmpty({ saveInvoice, refreshPaid, hashPassword });
 ensureManagement(hashPassword);
+ensureManagementWorkspace();
 normalizeRoles();
 ensureDefaults();
 ensureRolePerms();
+ensureTaskPerms();
 const { reminderQueue } = initFeatures({ api, need, wrap, fail, crud, saveInvoice, invoiceDetail, refreshPaid });
 registerGst({ api, need, wrap });
-registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState });
+registerTasks({ api, need, wrap, fail });
+export const voice = registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState, saveInvoice }); // exported for tests (voice._test)
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Invoice app running on http://localhost:${port}`));
