@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS memberships (
   UNIQUE (tenant_id, user_id)
 );
 -- a user belongs to (or is waiting for) at most one organisation at a time
+DROP INDEX IF EXISTS idx_member_pending;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_member_active ON memberships(user_id) WHERE status IN ('pending','approved');
 CREATE INDEX IF NOT EXISTS idx_member_tenant ON memberships(tenant_id, status);
 ${ROLES_SQL};
@@ -275,4 +276,11 @@ if (legacy) {
 
 // Platform "management" accounts see every organisation's summary (no organisation membership needed)
 addCol('users', 'is_management', 'INTEGER NOT NULL DEFAULT 0');
+addCol('tenants', 'modules', 'TEXT'); // JSON array of enabled modules (server/modules.js); NULL = all
+addCol('tenants', 'active', 'INTEGER NOT NULL DEFAULT 1'); // management can deactivate an organisation
+addCol('tenants', 'is_platform', 'INTEGER NOT NULL DEFAULT 0'); // management's own workspace: not listed or controlled as a customer org
+// the membership's role (kept alongside users.role_id)
+addCol('memberships', 'role_id', 'INTEGER REFERENCES roles(id) ON DELETE SET NULL');
+run(`UPDATE memberships SET role_id = (SELECT u.role_id FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = memberships.user_id AND r.tenant_id = memberships.tenant_id)
+  WHERE role_id IS NULL AND status = 'approved'`);
 addCol('clients', 'status', "TEXT NOT NULL DEFAULT 'active'"); // active | inactive | on_hold
