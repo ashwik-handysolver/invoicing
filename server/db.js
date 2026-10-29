@@ -1,286 +1,109 @@
-import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
+// Database: Supabase Postgres (connection string in SUPABASE_DB_URL).
+// all / get / run / tx keep the shape the app was written against (SQLite style, `?` placeholders) and are async.
+// Queries are translated to Postgres on the way through; see toPg().
+import pg from 'pg';
+import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { fileURLToPath } from 'node:url';
 
-const file = process.env.DB_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'invoice.db');
-export const db = new DatabaseSync(file);
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+const url = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
+if (!url) {
+  console.error('Missing SUPABASE_DB_URL: add your Supabase connection string to .env (Supabase → Connect → Session pooler).');
+  process.exit(1);
+}
+
+// COUNT/SUM come back as int8 / numeric: return them as JS numbers like SQLite did
+pg.types.setTypeParser(20, (v) => parseInt(v, 10));
+pg.types.setTypeParser(1700, (v) => parseFloat(v));
+
+export const pool = new pg.Pool({
+  connectionString: url,
+  ssl: /localhost|127\.0\.0\.1/.test(url) ? false : { rejectUnauthorized: false },
+  max: +(process.env.DB_POOL_MAX || (process.env.VERCEL ? 3 : 10)), // serverless: many small instances, few connections each
+  idleTimeoutMillis: 30000,
+});
+pool.on('error', (e) => console.error('db pool error', e.message));
+
+// Tables without an `id` column: INSERTs into them don't get RETURNING id
+const NO_ID = new Set(['settings', 'sessions', 'task_assignees']);
+const cache = new Map();
+// SQLite-flavoured SQL -> Postgres: ? -> $n, LIKE -> ILIKE (SQLite LIKE ignores case), COLLATE NOCASE -> lower(),
+// INSERT OR IGNORE -> ON CONFLICT DO NOTHING, CURRENT_TIMESTAMP -> same text format as before, char() -> chr(),
+// and INSERT ... RETURNING id so callers still get lastInsertRowid.
+function toPg(sql) {
+  let out = cache.get(sql);
+  if (out) return out;
+  let s = '', n = 0, q = null;
+  for (const ch of sql) {
+    if (q) { s += ch; if (ch === q) q = null; continue; }
+    if (ch === "'" || ch === '"') { q = ch; s += ch; continue; }
+    s += ch === '?' ? `$${++n}` : ch;
+  }
+  s = s.replace(/(\b[\w.]+)\s*=\s*(\$\d+)\s+COLLATE\s+NOCASE/gi, 'lower($1) = lower($2)')
+    .replace(/\s+COLLATE\s+NOCASE/gi, '')
+    .replace(/\bNOT\s+LIKE\b/g, 'NOT ILIKE').replace(/(?<!NOT )\bLIKE\b/g, 'ILIKE')
+    .replace(/\bCURRENT_TIMESTAMP\b/g, 'utc_now_text()')
+    .replace(/\bchar\((\d+)\)/g, 'chr($1)');
+  const ignore = /^\s*INSERT\s+OR\s+IGNORE\s+INTO/i.test(s);
+  if (ignore) s = s.replace(/^\s*INSERT\s+OR\s+IGNORE\s+INTO/i, 'INSERT INTO') + ' ON CONFLICT DO NOTHING';
+  const ins = s.match(/^\s*INSERT\s+INTO\s+(\w+)/i);
+  if (ins && !NO_ID.has(ins[1].toLowerCase()) && !/\bRETURNING\b/i.test(s)) s += ' RETURNING id';
+  out = s;
+  cache.set(sql, out);
+  return out;
+}
 
 const clean = (p) => p.map((x) => (x === undefined ? null : typeof x === 'boolean' ? +x : x));
-export const all = (sql, ...p) => db.prepare(sql).all(...clean(p));
-export const get = (sql, ...p) => db.prepare(sql).get(...clean(p));
-export const run = (sql, ...p) => db.prepare(sql).run(...clean(p));
-let txDepth = 0; // nested tx() calls join the outer transaction
-export function tx(fn) {
-  if (txDepth) return fn();
-  db.exec('BEGIN');
-  txDepth++;
-  try { const r = fn(); db.exec('COMMIT'); return r; }
-  catch (e) { db.exec('ROLLBACK'); throw e; }
-  finally { txDepth--; }
+const txStore = new AsyncLocalStorage(); // the client of the transaction we are inside, if any
+async function query(sql, p) {
+  await ready; // tables exist before the first query (some modules read settings while loading)
+  const c = txStore.getStore() || pool;
+  try { return await c.query(toPg(sql), clean(p)); }
+  catch (e) {
+    // keep the error text the app already maps ("UNIQUE constraint", "FOREIGN KEY constraint")
+    if (e.code === '23505') e.message = 'UNIQUE constraint failed: ' + e.message;
+    else if (e.code === '23503') e.message = 'FOREIGN KEY constraint failed: ' + e.message;
+    else if (e.code === '23514' || e.code === '23502') e.message = 'CHECK constraint failed: ' + e.message;
+    throw e;
+  }
+}
+export const all = async (sql, ...p) => (await query(sql, p)).rows;
+export const get = async (sql, ...p) => (await query(sql, p)).rows[0];
+export const run = async (sql, ...p) => { const r = await query(sql, p); return { changes: r.rowCount, lastInsertRowid: r.rows[0]?.id }; };
+// Nested tx() calls join the outer transaction
+export async function tx(fn) {
+  if (txStore.getStore()) return fn();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await txStore.run(client, fn);
+    await client.query('COMMIT');
+    return r;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
 }
 
-const cols = (t) => all(`PRAGMA table_info(${t})`).map((x) => x.name);
-const legacy = cols('roles').length > 0 && !cols('roles').includes('tenant_id'); // single-company DB from before organisation signup
+// Create / update tables (idempotent), then the app's install-wide settings
+const schema = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'supabase', 'schema.sql'), 'utf8');
+export const ready = pool.query(schema).catch((e) => { console.error('Could not prepare the database:', e.message); process.exit(1); });
 
-// Tenant = the organisation people sign up for / join. Its billing entities (GSTIN, bank…) live in `organisations`.
-const ROLES_SQL = `CREATE TABLE IF NOT EXISTS roles (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tenant_id INTEGER REFERENCES tenants(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  permissions TEXT NOT NULL DEFAULT '[]',
-  UNIQUE (tenant_id, name)
-)`;
-// role_id stays NULL until the user is an approved member of an organisation
-const USERS_SQL = `CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  password_hash TEXT NOT NULL,
-  role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-)`;
-const SETTINGS_SQL = 'CREATE TABLE IF NOT EXISTS settings (tenant_id INTEGER NOT NULL DEFAULT 0, key TEXT NOT NULL, value TEXT, PRIMARY KEY (tenant_id, key))';
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS tenants (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  invite_code TEXT NOT NULL UNIQUE,
-  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS memberships (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  decided_at TEXT, decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  UNIQUE (tenant_id, user_id)
-);
--- a user belongs to (or is waiting for) at most one organisation at a time
-DROP INDEX IF EXISTS idx_member_pending;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_member_active ON memberships(user_id) WHERE status IN ('pending','approved');
-CREATE INDEX IF NOT EXISTS idx_member_tenant ON memberships(tenant_id, status);
-${ROLES_SQL};
-${USERS_SQL};
-CREATE TABLE IF NOT EXISTS sessions (
-  token TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS organisations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  address TEXT, state TEXT, state_code TEXT,
-  gst_number TEXT, pan_number TEXT, email TEXT, contact TEXT,
-  bank_details TEXT
-);
-CREATE TABLE IF NOT EXISTS clients (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  name TEXT NOT NULL,
-  address TEXT, state TEXT, state_code TEXT,
-  gst_number TEXT, pan_number TEXT, email TEXT, mobile TEXT,
-  contact_person TEXT
-);
-CREATE TABLE IF NOT EXISTS service_products (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  sac_number TEXT, description TEXT,
-  price REAL DEFAULT 0, tax REAL DEFAULT 18
-);
-CREATE TABLE IF NOT EXISTS invoices (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  created_by INTEGER,
-  invoice_type TEXT NOT NULL CHECK (invoice_type IN ('proforma','tax')),
-  invoice_number TEXT NOT NULL,
-  invoice_series_int INTEGER NOT NULL,
-  fy TEXT NOT NULL,
-  invoice_date TEXT NOT NULL,
-  due_date TEXT,
-  organisation_id INTEGER NOT NULL REFERENCES organisations(id),
-  client_id INTEGER NOT NULL REFERENCES clients(id),
-  org_name TEXT, org_address TEXT, org_email TEXT, org_contact TEXT, org_gst TEXT, org_bank TEXT,
-  client_name TEXT, client_address TEXT, client_email TEXT, client_contact TEXT, client_gst TEXT,
-  place_of_supply TEXT,
-  gross_amount REAL DEFAULT 0, discount_amount REAL DEFAULT 0, selling_amount REAL DEFAULT 0,
-  igst REAL DEFAULT 0, cgst REAL DEFAULT 0, sgst REAL DEFAULT 0,
-  tds_percent REAL DEFAULT 0, tds_amount REAL DEFAULT 0,
-  total_amount REAL DEFAULT 0, net_amount REAL DEFAULT 0,
-  paid_amount REAL DEFAULT 0, balance_amount REAL DEFAULT 0,
-  payment_status TEXT NOT NULL DEFAULT 'unpaid',
-  converted_to_id INTEGER, converted_from_id INTEGER,
-  notes TEXT,
-  UNIQUE (organisation_id, invoice_number)
-);
-CREATE INDEX IF NOT EXISTS idx_inv_client ON invoices(client_id);
-CREATE INDEX IF NOT EXISTS idx_inv_date ON invoices(invoice_date);
-CREATE TABLE IF NOT EXISTS invoice_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  service_product_id INTEGER,
-  position INTEGER,
-  sac_number TEXT, description TEXT,
-  price REAL, quantity REAL,
-  gross_amount REAL, discount_percent REAL, discount_amount REAL, selling_amount REAL,
-  tax REAL, igst REAL, cgst REAL, sgst REAL, total_amount REAL
-);
-CREATE TABLE IF NOT EXISTS payments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  amount REAL NOT NULL,
-  paid_on TEXT NOT NULL,
-  mode TEXT, reference TEXT, notes TEXT,
-  created_by INTEGER,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS message_templates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  channel TEXT NOT NULL CHECK (channel IN ('whatsapp','email')),
-  kind TEXT NOT NULL DEFAULT 'reminder' CHECK (kind IN ('reminder','invoice','receipt')),
-  subject TEXT,
-  body TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS reminder_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  client_id INTEGER, invoice_id INTEGER,
-  channel TEXT, template_id INTEGER, sent_by INTEGER,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS email_notify (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT NOT NULL
-);
-`);
-
-for (const col of ['logo', 'signature', 'footer_note', 'terms', 'upi_id']) {
-  if (!all('PRAGMA table_info(organisations)').some((x) => x.name === col)) db.exec(`ALTER TABLE organisations ADD COLUMN ${col} TEXT`);
-}
-
-/* ---- v2 migrations ---- */
-const addCol = (t, c, def) => { if (!all(`PRAGMA table_info(${t})`).some((x) => x.name === c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`); };
-addCol('invoices', 'credit_amount', 'REAL DEFAULT 0');
-addCol('invoices', 'share_token', 'TEXT');
-addCol('invoices', 'viewed_at', 'TEXT');
-addCol('invoices', 'view_count', 'INTEGER DEFAULT 0');
-addCol('reminder_log', 'rule', 'INTEGER');
-
-// message_templates.kind gains 'receipt' (SQLite can't alter a CHECK, so rebuild the table once)
-if (!get("SELECT sql FROM sqlite_master WHERE name = 'message_templates'").sql.includes('receipt')) {
-  db.exec(`ALTER TABLE message_templates RENAME TO mt_old;
-    CREATE TABLE message_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-      channel TEXT NOT NULL CHECK (channel IN ('whatsapp','email')),
-      kind TEXT NOT NULL DEFAULT 'reminder' CHECK (kind IN ('reminder','invoice','receipt')), subject TEXT, body TEXT NOT NULL);
-    INSERT INTO message_templates (id, name, channel, kind, subject, body) SELECT id, name, channel, kind, subject, body FROM mt_old;
-    DROP TABLE mt_old;`);
-}
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS recurring_invoices (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP, created_by INTEGER,
-  organisation_id INTEGER NOT NULL, client_id INTEGER NOT NULL,
-  invoice_type TEXT NOT NULL DEFAULT 'tax',
-  frequency TEXT NOT NULL, start_date TEXT NOT NULL, next_run TEXT NOT NULL, end_date TEXT,
-  due_days INTEGER DEFAULT 7, tds_percent REAL DEFAULT 0, notes TEXT, items_json TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1, run_count INTEGER NOT NULL DEFAULT 0,
-  last_invoice_id INTEGER, last_run_at TEXT, source_invoice_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS credit_notes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP, created_by INTEGER,
-  number TEXT NOT NULL, fy TEXT NOT NULL, series_int INTEGER NOT NULL,
-  note_date TEXT NOT NULL, invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  organisation_id INTEGER NOT NULL, reason TEXT,
-  taxable REAL DEFAULT 0, tax_rate REAL DEFAULT 0, igst REAL DEFAULT 0, cgst REAL DEFAULT 0, sgst REAL DEFAULT 0, total REAL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS expenses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  date TEXT NOT NULL, category TEXT, vendor TEXT, amount REAL NOT NULL DEFAULT 0, notes TEXT
-);
-CREATE TABLE IF NOT EXISTS activity_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  user_id INTEGER, user_name TEXT, action TEXT, entity TEXT, entity_id INTEGER, summary TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_act_created ON activity_log(created_at);
-`);
-if (!cols('settings').length) db.exec(SETTINGS_SQL);
 // tenant 0 holds install-wide flags
-export const getSetting = (k, dflt, tid = 0) => { const r = get('SELECT value FROM settings WHERE tenant_id = ? AND key = ?', tid, k); return r ? JSON.parse(r.value) : dflt; };
+export const getSetting = async (k, dflt, tid = 0) => { const r = await get('SELECT value FROM settings WHERE tenant_id = ? AND key = ?', tid, k); return r ? JSON.parse(r.value) : dflt; };
 export const setSetting = (k, v, tid = 0) => run('INSERT INTO settings (tenant_id, key, value) VALUES (?, ?, ?) ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value', tid, k, JSON.stringify(v));
 
-addCol('invoices', 'gst_applied', 'INTEGER DEFAULT 1');
-addCol('invoices', 'pay_qr', 'INTEGER DEFAULT 1');
-addCol('invoices', 'pay_upi', 'INTEGER DEFAULT 1');
-addCol('invoices', 'pay_bank', 'INTEGER DEFAULT 1');
-addCol('organisations', 'qr_image', 'TEXT');
-addCol('recurring_invoices', 'gst_applied', 'INTEGER DEFAULT 1');
-addCol('recurring_invoices', 'pay_qr', 'INTEGER DEFAULT 1');
-addCol('recurring_invoices', 'pay_upi', 'INTEGER DEFAULT 1');
-addCol('recurring_invoices', 'pay_bank', 'INTEGER DEFAULT 1');
-
-/* ---- v3: organisation signup (multi-tenant) ---- */
+/* ---- organisation invite codes ---- */
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
 export const normCode = (c) => {
   const x = String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   return x.length === 10 ? `${x.slice(0, 5)}-${x.slice(5)}` : null;
 };
-export function newInviteCode() {
+export async function newInviteCode() {
   for (;;) {
     const code = normCode(Array.from({ length: 10 }, () => CODE_CHARS[crypto.randomInt(CODE_CHARS.length)]).join(''));
-    if (!get('SELECT 1 AS x FROM tenants WHERE invite_code = ?', code)) return code;
+    if (!(await get('SELECT 1 AS x FROM tenants WHERE invite_code = ?', code))) return code;
   }
 }
-
-// Every organisation-owned table carries tenant_id; child rows (items, payments) are reached through their invoice.
-const TENANT_TABLES = ['organisations', 'clients', 'service_products', 'invoices', 'message_templates', 'reminder_log', 'email_notify',
-  'recurring_invoices', 'credit_notes', 'expenses', 'activity_log'];
-for (const t of TENANT_TABLES) {
-  addCol(t, 'tenant_id', 'INTEGER REFERENCES tenants(id) ON DELETE CASCADE');
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_${t}_tenant ON ${t}(tenant_id)`);
-}
-
-if (legacy) {
-  // Existing single-company data becomes organisation #1; everyone already there stays an approved member.
-  db.exec('PRAGMA foreign_keys = OFF');
-  tx(() => {
-    const first = get('SELECT name FROM organisations ORDER BY id LIMIT 1');
-    const tid = run('INSERT INTO tenants (name, invite_code) VALUES (?, ?)', first?.name || 'My organisation', newInviteCode()).lastInsertRowid;
-    db.exec(`${ROLES_SQL.replace('IF NOT EXISTS roles', 'roles_new')};
-      INSERT INTO roles_new (id, tenant_id, name, permissions) SELECT id, ${tid}, name, permissions FROM roles;
-      DROP TABLE roles; ALTER TABLE roles_new RENAME TO roles;
-      ${USERS_SQL.replace('IF NOT EXISTS users', 'users_new')};
-      INSERT INTO users_new SELECT id, name, email, password_hash, role_id, active, created_at FROM users;
-      DROP TABLE users; ALTER TABLE users_new RENAME TO users;
-      ALTER TABLE settings RENAME TO settings_old; ${SETTINGS_SQL};
-      INSERT INTO settings (tenant_id, key, value) SELECT ${tid}, key, value FROM settings_old WHERE key != 'perms_v2';
-      INSERT INTO settings (tenant_id, key, value) SELECT 0, key, value FROM settings_old WHERE key = 'perms_v2';
-      DROP TABLE settings_old;`);
-    for (const t of TENANT_TABLES) run(`UPDATE ${t} SET tenant_id = ? WHERE tenant_id IS NULL`, tid);
-    run(`INSERT INTO memberships (tenant_id, user_id, role, status, decided_at)
-         SELECT ?, u.id, CASE WHEN r.permissions LIKE '%"*"%' THEN 'admin' ELSE 'member' END, 'approved', CURRENT_TIMESTAMP
-         FROM users u JOIN roles r ON r.id = u.role_id`, tid);
-    run("UPDATE tenants SET created_by = (SELECT MIN(user_id) FROM memberships WHERE tenant_id = ? AND role = 'admin') WHERE id = ?", tid, tid);
-  });
-  db.exec('PRAGMA foreign_keys = ON');
-}
-
-// Platform "management" accounts see every organisation's summary (no organisation membership needed)
-addCol('users', 'is_management', 'INTEGER NOT NULL DEFAULT 0');
-addCol('tenants', 'modules', 'TEXT'); // JSON array of enabled modules (server/modules.js); NULL = all
-addCol('tenants', 'active', 'INTEGER NOT NULL DEFAULT 1'); // management can deactivate an organisation
-addCol('tenants', 'is_platform', 'INTEGER NOT NULL DEFAULT 0'); // management's own workspace: not listed or controlled as a customer org
-// the membership's role (kept alongside users.role_id)
-addCol('memberships', 'role_id', 'INTEGER REFERENCES roles(id) ON DELETE SET NULL');
-run(`UPDATE memberships SET role_id = (SELECT u.role_id FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = memberships.user_id AND r.tenant_id = memberships.tenant_id)
-  WHERE role_id IS NULL AND status = 'approved'`);
-addCol('clients', 'status', "TEXT NOT NULL DEFAULT 'active'"); // active | inactive | on_hold

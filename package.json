@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node --no-warnings server/index.js",
-    "dev": "node --no-warnings --watch server/index.js"
+    "dev": "node --no-warnings --watch server/index.js",
+    "db:copy": "node --no-warnings scripts/copy-sqlite-to-supabase.mjs"
   },
   "engines": {
     "node": ">=22.5"
@@ -15,6 +16,7 @@
     "@google/genai": "^2.30.0",
     "exceljs": "^4.4.0",
     "express": "^4.21.0",
+    "pg": "^8.23.1",
     "qrcode-generator": "^2.0.4"
   }
 }

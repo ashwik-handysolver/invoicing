@@ -53,28 +53,30 @@ export { hashPassword };
 const hasPerm = (perms, key) => perms.includes('*') || perms.includes(key);
 const SESSION_DAYS = 30;
 
-const newSession = (userId) => {
+const newSession = async (userId) => {
   const token = crypto.randomBytes(32).toString('hex');
-  run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', token, userId);
+  (await run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', token, userId));
   return token;
 };
 
 // Signed-in user + their organisation membership. Permissions apply only while the membership is approved.
-function auth(req, res, next) {
+// (errors -> 500 instead of a hung request: Express 4 doesn't catch rejected middleware)
+const auth = (req, res, next) => authUser(req, res, next).catch((e) => { console.error('auth', e.message); if (!res.headersSent) res.status(500).json({ error: 'Server error' }); });
+async function authUser(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer /, '');
-  const row = token && get(
+  const row = token && (await get(
     `SELECT u.id, u.name, u.email, u.active, u.role_id, u.is_management, s.created_at AS sess_at
-       FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`, token);
+       FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`, token));
   if (!row || !row.active || Date.now() - new Date(row.sess_at + 'Z').getTime() > SESSION_DAYS * 864e5) {
     return res.status(401).json({ error: 'Not signed in' });
   }
-  const m = get(`SELECT m.tenant_id, m.role, m.role_id, m.status, m.created_at, m.decided_at, t.name AS tenant_name, t.modules, t.active AS tenant_active
+  const m = (await get(`SELECT m.tenant_id, m.role, m.role_id, m.status, m.created_at, m.decided_at, t.name AS tenant_name, t.modules, t.active AS tenant_active
        FROM memberships m JOIN tenants t ON t.id = m.tenant_id WHERE m.user_id = ?
-       ORDER BY CASE m.status WHEN 'approved' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, m.id DESC LIMIT 1`, row.id);
+       ORDER BY CASE m.status WHEN 'approved' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, m.id DESC LIMIT 1`, row.id));
   // a deactivated organisation behaves like no membership: its members are shown a "deactivated" screen
   if (m?.status === 'approved' && !m.tenant_active) m.status = 'deactivated';
   const approved = m?.status === 'approved';
-  const role = approved ? get('SELECT name, permissions FROM roles WHERE id = ? AND tenant_id = ?', m.role_id ?? row.role_id, m.tenant_id) : null;
+  const role = approved ? (await get('SELECT name, permissions FROM roles WHERE id = ? AND tenant_id = ?', m.role_id ?? row.role_id, m.tenant_id)) : null;
   const modules = approved ? tenantModules(m.modules) : [];
   const perms = role ? permsForModules(JSON.parse(role.permissions), modules, ALL_KEYS) : [];
   if (row.is_management) perms.push('management.view');
@@ -89,8 +91,8 @@ const member = (req, res, next) => (req.user.tid ? next()
 const need = (key) => (req, res, next) =>
   hasPerm(req.user.perms, key) ? next() : res.status(403).json({ error: `You don't have permission (${key})` });
 
-const wrap = (fn) => (req, res) => {
-  try { const out = fn(req, res); if (out !== undefined && !res.headersSent) res.json(out); }
+const wrap = (fn) => async (req, res) => {
+  try { const out = await fn(req, res); if (out !== undefined && !res.headersSent) res.json(out); }
   catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message });
     if (/constraint/i.test(e.message)) {
@@ -106,41 +108,51 @@ const fail = (status, message) => Object.assign(new Error(message), { status });
 const today = () => new Date().toISOString().slice(0, 10);
 
 /* ---------------------------------------------------------------- auth */
-app.post('/api/login', wrap((req) => {
+app.post('/api/login', wrap(async (req) => {
   const { email, password } = req.body || {};
-  const u = get('SELECT * FROM users WHERE email = ? COLLATE NOCASE', (email || '').trim());
+  const u = (await get('SELECT * FROM users WHERE email = ? COLLATE NOCASE', (email || '').trim()));
   if (!u || !u.active || !checkPassword(password || '', u.password_hash)) throw fail(401, 'Wrong email or password');
-  return { token: newSession(u.id) };
+  return { token: (await newSession(u.id)) };
 }));
 
 // Public, read-only invoice page for clients (link shared by the owner)
-app.get('/api/public/invoice/:token', wrap((req) => {
-  const row = get('SELECT id, tenant_id FROM invoices WHERE share_token = ?', req.params.token);
+app.get('/api/public/invoice/:token', wrap(async (req) => {
+  const row = (await get('SELECT id, tenant_id FROM invoices WHERE share_token = ?', req.params.token));
   if (!row) throw fail(404, 'This link is no longer valid');
-  run('UPDATE invoices SET view_count = COALESCE(view_count,0) + 1, viewed_at = CURRENT_TIMESTAMP WHERE id = ?', row.id);
-  const v = invoiceDetail(row.id, row.tenant_id);
+  (await run('UPDATE invoices SET view_count = COALESCE(view_count,0) + 1, viewed_at = CURRENT_TIMESTAMP WHERE id = ?', row.id));
+  const v = (await invoiceDetail(row.id, row.tenant_id));
   for (const k of ['created_by', 'share_token', 'payments', 'view_count', 'viewed_at', 'tenant_id']) delete v[k];
   return v;
 }));
 app.get('/p/:token', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
+// Recurring invoices: on a normal server a timer runs this hourly; on Vercel, Vercel Cron calls it (vercel.json),
+// signed with CRON_SECRET.
+let runRecurring = null; // set once features are registered (below)
+app.get('/api/cron/recurring', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) return res.status(401).json({ error: 'Not allowed' });
+  try { await runRecurring(); res.json({ ok: true }); }
+  catch (e) { console.error('recurring cron failed', e.message); res.status(500).json({ error: 'Recurring run failed' }); }
+});
+
 const base = express.Router(); // signed in, in any membership state
 base.use(auth);
-base.post('/logout', wrap((req) => { run('DELETE FROM sessions WHERE token = ?', req.user.token); return { ok: true }; }));
+base.post('/logout', wrap(async (req) => { (await run('DELETE FROM sessions WHERE token = ?', req.user.token)); return { ok: true }; }));
 base.get('/me', wrap((req) => {
   const { token, tid, ...user } = req.user;
   return { user };
 }));
 // Any signed-in user: change your own name, email or password. Needs your current password; a new password signs out your other sessions.
-base.put('/account', wrap((req) => {
-  const b = req.body || {}, u = get('SELECT * FROM users WHERE id = ?', req.user.id);
+base.put('/account', wrap(async (req) => {
+  const b = req.body || {}, u = (await get('SELECT * FROM users WHERE id = ?', req.user.id));
   if (!checkPassword(String(b.current_password || ''), u.password_hash)) throw fail(400, 'Current password is incorrect');
   const o = {};
   if (b.name !== undefined) { o.name = String(b.name).trim(); if (!o.name) throw fail(400, 'Name is required'); }
   if (b.email !== undefined) {
     o.email = String(b.email).trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(o.email)) throw fail(400, 'Enter a valid email address');
-    if (get('SELECT 1 AS x FROM users WHERE email = ? COLLATE NOCASE AND id != ?', o.email, u.id)) throw fail(409, 'That email is already used by another account');
+    if ((await get('SELECT 1 AS x FROM users WHERE email = ? COLLATE NOCASE AND id != ?', o.email, u.id))) throw fail(409, 'That email is already used by another account');
   }
   if (b.new_password) {
     const pw = String(b.new_password);
@@ -149,9 +161,9 @@ base.put('/account', wrap((req) => {
   }
   const keys = Object.keys(o);
   if (!keys.length) throw fail(400, 'Nothing to change');
-  run(`UPDATE users SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => o[k]), u.id);
-  if (o.password_hash) run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token);
-  if (req.user.tid) logAct(req.user, 'update', 'user', u.id, `${req.user.name} updated their ${[o.name && 'name', o.email && 'email', o.password_hash && 'password'].filter(Boolean).join(', ')}`);
+  (await run(`UPDATE users SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => o[k]), u.id));
+  if (o.password_hash) (await run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token));
+  if (req.user.tid) (await logAct(req.user, 'update', 'user', u.id, `${req.user.name} updated their ${[o.name && 'name', o.email && 'email', o.password_hash && 'password'].filter(Boolean).join(', ')}`));
   return { ok: true, user: { name: o.name || u.name, email: o.email || u.email } };
 }));
 registerOrgs({ app, base, wrap, fail, hashPassword, checkPassword, newSession, hasPerm });
@@ -175,11 +187,11 @@ api.get('/gst-lookup/:gstin', async (req, res) => {
     res.json({ gstin, name: t.tradeNam || t.lgnm || '', legal_name: t.lgnm || '', address: addr, status: t.sts || '' });
   } catch (e) { res.status(e.status || 500).json({ error: e.status ? e.message : 'Lookup failed' }); }
 });
-api.get('/meta', wrap((req) => ({
+api.get('/meta', wrap(async (req) => ({
   gst_lookup: !!process.env.GST_API_KEY,
   states: STATES,
   permissions: PERMISSIONS,
-  organisations: all('SELECT * FROM organisations WHERE tenant_id = ? ORDER BY name', req.user.tid),
+  organisations: (await all('SELECT * FROM organisations WHERE tenant_id = ? ORDER BY name', req.user.tid)),
 })));
 
 /* ---------------------------------------------------------------- generic CRUD */
@@ -190,30 +202,30 @@ function crud(name, table, cols, { perm = name, write, order = 'id DESC', before
     for (const c of cols) if (body[c] !== undefined) o[c] = typeof body[c] === 'string' ? body[c].trim() : body[c];
     return beforeSave ? beforeSave(o, body) : o;
   };
-  const one = (req) => get(`SELECT * FROM ${table} WHERE id = ? AND tenant_id = ?`, req.params.id, req.user.tid) || (() => { throw fail(404, 'Not found'); })();
-  api.get(`/${name}`, need(key('view')), wrap((req) => all(`SELECT * FROM ${table} WHERE tenant_id = ? ORDER BY ${order}`, req.user.tid)));
+  const one = async (req) => (await get(`SELECT * FROM ${table} WHERE id = ? AND tenant_id = ?`, req.params.id, req.user.tid)) || (() => { throw fail(404, 'Not found'); })();
+  api.get(`/${name}`, need(key('view')), wrap(async (req) => (await all(`SELECT * FROM ${table} WHERE tenant_id = ? ORDER BY ${order}`, req.user.tid))));
   api.get(`/${name}/:id`, need(key('view')), wrap(one));
-  api.post(`/${name}`, need(key('create')), wrap((req) => {
-    const o = pick(req.body);
+  api.post(`/${name}`, need(key('create')), wrap(async (req) => {
+    const o = (await pick(req.body));
     if (!o[cols[0]]) throw fail(400, `${cols[0]} is required`);
     const keys = Object.keys(o);
-    const r = run(`INSERT INTO ${table} (tenant_id, ${keys.join(',')}) VALUES (?, ${keys.map(() => '?').join(',')})`, req.user.tid, ...keys.map((k) => o[k]));
-    logAct(req.user, 'create', name, r.lastInsertRowid, String(o[cols[0]] ?? ''));
-    const row = get(`SELECT * FROM ${table} WHERE id = ?`, r.lastInsertRowid);
-    afterSave && afterSave(req, row);
+    const r = (await run(`INSERT INTO ${table} (tenant_id, ${keys.join(',')}) VALUES (?, ${keys.map(() => '?').join(',')})`, req.user.tid, ...keys.map((k) => o[k])));
+    (await logAct(req.user, 'create', name, r.lastInsertRowid, String(o[cols[0]] ?? '')));
+    const row = (await get(`SELECT * FROM ${table} WHERE id = ?`, r.lastInsertRowid));
+    if (afterSave) await afterSave(req, row);
     return row;
   }));
-  api.put(`/${name}/:id`, need(key('edit')), wrap((req) => {
-    one(req);
-    const o = pick(req.body);
+  api.put(`/${name}/:id`, need(key('edit')), wrap(async (req) => {
+    (await one(req));
+    const o = (await pick(req.body));
     const keys = Object.keys(o);
-    if (keys.length) run(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(',')} WHERE id = ? AND tenant_id = ?`, ...keys.map((k) => o[k]), req.params.id, req.user.tid);
-    logAct(req.user, 'update', name, +req.params.id, String(o[cols[0]] ?? ''));
-    const row = one(req);
-    afterSave && afterSave(req, row);
+    if (keys.length) (await run(`UPDATE ${table} SET ${keys.map((k) => `${k} = ?`).join(',')} WHERE id = ? AND tenant_id = ?`, ...keys.map((k) => o[k]), req.params.id, req.user.tid));
+    (await logAct(req.user, 'update', name, +req.params.id, String(o[cols[0]] ?? '')));
+    const row = (await one(req));
+    if (afterSave) await afterSave(req, row);
     return row;
   }));
-  api.delete(`/${name}/:id`, need(key('delete')), wrap((req) => { const old = one(req); run(`DELETE FROM ${table} WHERE id = ? AND tenant_id = ?`, old.id, req.user.tid); logAct(req.user, 'delete', name, old.id, String(old[cols[0]] ?? '')); return { ok: true }; }));
+  api.delete(`/${name}/:id`, need(key('delete')), wrap(async (req) => { const old = (await one(req)); (await run(`DELETE FROM ${table} WHERE id = ? AND tenant_id = ?`, old.id, req.user.tid)); (await logAct(req.user, 'delete', name, old.id, String(old[cols[0]] ?? ''))); return { ok: true }; }));
 }
 
 const withState = (o) => {
@@ -242,8 +254,8 @@ const checkOrg = (o) => {
   if (o.email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(o.email)) throw fail(400, 'Enter a valid organisation email');
   return withState(o);
 };
-const syncTenantName = (req, row) => {
-  if (row.id === get('SELECT MIN(id) AS id FROM organisations WHERE tenant_id = ?', req.user.tid).id) run('UPDATE tenants SET name = ? WHERE id = ?', row.name, req.user.tid);
+const syncTenantName = async (req, row) => {
+  if (row.id === (await get('SELECT MIN(id) AS id FROM organisations WHERE tenant_id = ?', req.user.tid)).id) (await run('UPDATE tenants SET name = ? WHERE id = ?', row.name, req.user.tid));
 };
 crud('organisations', 'organisations', ['name', 'address', 'gst_number', 'pan_number', 'email', 'contact', 'bank_details', 'logo', 'signature', 'qr_image', 'footer_note', 'terms', 'upi_id', 'state', 'state_code'], { perm: 'settings', write: 'edit', order: 'name', beforeSave: checkOrg, afterSave: syncTenantName });
 crud('cc-emails', 'email_notify', ['email'], { perm: 'settings', write: 'edit', order: 'email' });
@@ -252,120 +264,120 @@ crud('cc-emails', 'email_notify', ['email'], { perm: 'settings', write: 'edit', 
 /* ---------------------------------------------------------------- roles & users */
 // User types are fixed per organisation (Admin, Team member): roles can be listed, not created, edited or deleted.
 api.use('/roles', (req, res, next) => (req.method === 'GET' ? next() : res.status(400).json({ error: 'User types are fixed: Admin and Team member.' })));
-api.get('/roles', (req, res, next) => (hasPerm(req.user.perms, 'roles.view') || hasPerm(req.user.perms, 'users.view') ? next() : res.status(403).json({ error: "You don't have permission (users.view)" })), wrap((req) => all('SELECT * FROM roles WHERE tenant_id = ? ORDER BY id', req.user.tid).map((r) => ({ ...r, permissions: JSON.parse(r.permissions) }))));
-const tenantRole = (id, tid) => {
-  const r = id && get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', id, tid);
+api.get('/roles', (req, res, next) => (hasPerm(req.user.perms, 'roles.view') || hasPerm(req.user.perms, 'users.view') ? next() : res.status(403).json({ error: "You don't have permission (users.view)" })), wrap(async (req) => (await all('SELECT * FROM roles WHERE tenant_id = ? ORDER BY id', req.user.tid)).map((r) => ({ ...r, permissions: JSON.parse(r.permissions) }))));
+const tenantRole = async (id, tid) => {
+  const r = id && (await get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', id, tid));
   if (!r) throw fail(400, 'Pick a valid role');
   return { ...r, admin: JSON.parse(r.permissions).includes('*') };
 };
 const cleanPerms = (p) => (Array.isArray(p) ? p.filter((k) => ALL_KEYS.includes(k)) : []);
-api.post('/roles', need('roles.create'), wrap((req) => {
+api.post('/roles', need('roles.create'), wrap(async (req) => {
   const name = (req.body.name || '').trim();
   if (!name) throw fail(400, 'Name is required');
-  const r = run('INSERT INTO roles (tenant_id, name, permissions) VALUES (?, ?, ?)', req.user.tid, name, JSON.stringify(cleanPerms(req.body.permissions)));
-  logAct(req.user, 'create', 'role', r.lastInsertRowid, name);
+  const r = (await run('INSERT INTO roles (tenant_id, name, permissions) VALUES (?, ?, ?)', req.user.tid, name, JSON.stringify(cleanPerms(req.body.permissions))));
+  (await logAct(req.user, 'create', 'role', r.lastInsertRowid, name));
   return { id: r.lastInsertRowid };
 }));
-api.put('/roles/:id', need('roles.edit'), wrap((req) => {
-  const role = get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
+api.put('/roles/:id', need('roles.edit'), wrap(async (req) => {
+  const role = (await get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid));
   if (!role) throw fail(404, 'Not found');
   if (JSON.parse(role.permissions).includes('*')) throw fail(400, 'The Admin role cannot be changed');
-  run('UPDATE roles SET name = ?, permissions = ? WHERE id = ?', (req.body.name || role.name).trim(), JSON.stringify(cleanPerms(req.body.permissions)), role.id);
-  logAct(req.user, 'update', 'role', role.id, `${role.name} permissions changed`);
+  (await run('UPDATE roles SET name = ?, permissions = ? WHERE id = ?', (req.body.name || role.name).trim(), JSON.stringify(cleanPerms(req.body.permissions)), role.id));
+  (await logAct(req.user, 'update', 'role', role.id, `${role.name} permissions changed`));
   return { ok: true };
 }));
-api.delete('/roles/:id', need('roles.delete'), wrap((req) => {
-  const role = get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
+api.delete('/roles/:id', need('roles.delete'), wrap(async (req) => {
+  const role = (await get('SELECT * FROM roles WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid));
   if (!role) throw fail(404, 'Not found');
   if (JSON.parse(role.permissions).includes('*')) throw fail(400, 'The Admin role cannot be deleted');
-  if (get('SELECT 1 AS x FROM memberships WHERE role_id = ?', role.id)) throw fail(409, 'This role is assigned to users. Move them to another role first.');
-  run('DELETE FROM roles WHERE id = ?', role.id);
+  if ((await get('SELECT 1 AS x FROM memberships WHERE role_id = ?', role.id))) throw fail(409, 'This role is assigned to users. Move them to another role first.');
+  (await run('DELETE FROM roles WHERE id = ?', role.id));
   return { ok: true };
 }));
 
 const userRow = `SELECT u.id, u.name, u.email, u.active, COALESCE(m.role_id, u.role_id) AS role_id, r.name AS role, m.role AS membership_role
   FROM memberships m JOIN users u ON u.id = m.user_id LEFT JOIN roles r ON r.id = COALESCE(m.role_id, u.role_id) AND r.tenant_id = m.tenant_id WHERE m.tenant_id = ? AND m.status = 'approved'`;
-const memberOf = (req) => get(`${userRow} AND u.id = ?`, req.user.tid, req.params.id) || (() => { throw fail(404, 'Not found'); })();
-const adminCount = (tid) => get("SELECT COUNT(*) AS n FROM memberships WHERE tenant_id = ? AND status = 'approved' AND role = 'admin'", tid).n;
-api.get('/users', need('users.view'), wrap((req) => all(`${userRow} ORDER BY u.name`, req.user.tid)));
-api.post('/users', need('users.create'), wrap((req) => {
+const memberOf = async (req) => (await get(`${userRow} AND u.id = ?`, req.user.tid, req.params.id)) || (() => { throw fail(404, 'Not found'); })();
+const adminCount = async (tid) => (await get("SELECT COUNT(*) AS n FROM memberships WHERE tenant_id = ? AND status = 'approved' AND role = 'admin'", tid)).n;
+api.get('/users', need('users.view'), wrap(async (req) => (await all(`${userRow} ORDER BY u.name`, req.user.tid))));
+api.post('/users', need('users.create'), wrap(async (req) => {
   const { name, email, password, role_id } = req.body;
   if (!name || !email || !password || !role_id) throw fail(400, 'Name, email, password and role are required');
   if (password.length < 6) throw fail(400, 'Password must be at least 6 characters');
-  const role = tenantRole(role_id, req.user.tid);
+  const role = (await tenantRole(role_id, req.user.tid));
   if (role.admin && !req.user.isAdmin) throw fail(403, 'Only admins can add admins');
-  if (get('SELECT 1 AS x FROM users WHERE email = ?', email.trim())) throw fail(409, 'This email already has an account. Ask them to join with your organisation code.');
-  const id = tx(() => {
-    const uid = run('INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)', name.trim(), email.trim().toLowerCase(), hashPassword(password), role.id).lastInsertRowid;
-    run("INSERT INTO memberships (tenant_id, user_id, role, role_id, status, decided_at, decided_by) VALUES (?, ?, ?, ?, 'approved', CURRENT_TIMESTAMP, ?)", req.user.tid, uid, role.admin ? 'admin' : 'member', role.id, req.user.id);
+  if ((await get('SELECT 1 AS x FROM users WHERE email = ?', email.trim()))) throw fail(409, 'This email already has an account. Ask them to join with your organisation code.');
+  const id = (await tx(async () => {
+    const uid = (await run('INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)', name.trim(), email.trim().toLowerCase(), hashPassword(password), role.id)).lastInsertRowid;
+    (await run("INSERT INTO memberships (tenant_id, user_id, role, role_id, status, decided_at, decided_by) VALUES (?, ?, ?, ?, 'approved', CURRENT_TIMESTAMP, ?)", req.user.tid, uid, role.admin ? 'admin' : 'member', role.id, req.user.id));
     return uid;
-  });
-  logAct(req.user, 'create', 'user', id, email);
+  }));
+  (await logAct(req.user, 'create', 'user', id, email));
   return { id };
 }));
-api.put('/users/:id', need('users.edit'), wrap((req) => {
+api.put('/users/:id', need('users.edit'), wrap(async (req) => {
   const { name, email, password, role_id, active } = req.body;
-  const u = memberOf(req), cur = get('SELECT * FROM users WHERE id = ?', u.id);
+  const u = (await memberOf(req)), cur = (await get('SELECT * FROM users WHERE id = ?', u.id));
   if (u.membership_role === 'admin' && !req.user.isAdmin) throw fail(403, 'Only admins can change an admin account');
   if (u.id === req.user.id && (active === false || active === 0)) throw fail(400, "You can't deactivate yourself");
   if (password && password.length < 6) throw fail(400, 'Password must be at least 6 characters');
-  const role = role_id && +role_id !== u.role_id ? tenantRole(role_id, req.user.tid) : null;
+  const role = role_id && +role_id !== u.role_id ? (await tenantRole(role_id, req.user.tid)) : null;
   if (role && u.id === req.user.id) throw fail(400, "You can't change your own role");
   if (role?.admin && !req.user.isAdmin) throw fail(403, 'Only admins can make someone an admin');
-  if (role && !role.admin && u.membership_role === 'admin' && adminCount(req.user.tid) <= 1) throw fail(400, 'Your organisation needs at least one admin');
-  tx(() => {
-    run('UPDATE users SET name = ?, email = ?, active = ?, password_hash = ? WHERE id = ?',
+  if (role && !role.admin && u.membership_role === 'admin' && (await adminCount(req.user.tid)) <= 1) throw fail(400, 'Your organisation needs at least one admin');
+  (await tx(async () => {
+    (await run('UPDATE users SET name = ?, email = ?, active = ?, password_hash = ? WHERE id = ?',
       (name || cur.name).trim(), (email || cur.email).trim().toLowerCase(),
-      active === undefined ? cur.active : +!!active, password ? hashPassword(password) : cur.password_hash, u.id);
-    if (role) run('UPDATE memberships SET role = ?, role_id = ? WHERE user_id = ? AND tenant_id = ?', role.admin ? 'admin' : 'member', role.id, u.id, req.user.tid);
-  });
-  logAct(req.user, 'update', 'user', u.id, u.email);
-  if (password || active === false || active === 0) run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token);
+      active === undefined ? cur.active : +!!active, password ? hashPassword(password) : cur.password_hash, u.id));
+    if (role) (await run('UPDATE memberships SET role = ?, role_id = ? WHERE user_id = ? AND tenant_id = ?', role.admin ? 'admin' : 'member', role.id, u.id, req.user.tid));
+  }));
+  (await logAct(req.user, 'update', 'user', u.id, u.email));
+  if (password || active === false || active === 0) (await run('DELETE FROM sessions WHERE user_id = ? AND token != ?', u.id, req.user.token));
   return { ok: true };
 }));
-api.delete('/users/:id', need('users.delete'), wrap((req) => {
+api.delete('/users/:id', need('users.delete'), wrap(async (req) => {
   if (+req.params.id === req.user.id) throw fail(400, "You can't delete yourself");
-  const u = memberOf(req);
+  const u = (await memberOf(req));
   if (u.membership_role === 'admin' && !req.user.isAdmin) throw fail(403, 'Only admins can remove an admin');
-  run('DELETE FROM users WHERE id = ?', u.id);
-  logAct(req.user, 'delete', 'user', u.id, u.email);
+  (await run('DELETE FROM users WHERE id = ?', u.id));
+  (await logAct(req.user, 'delete', 'user', u.id, u.email));
   return { ok: true };
 }));
 /* ---------------------------------------------------------------- invoices */
 const PREFIX = { proforma: 'PI', tax: 'TI' };
 
-function nextNumber(orgId, type, fy) { // organisation ids are already tenant-checked
-  const row = get('SELECT MAX(invoice_series_int) AS m FROM invoices WHERE organisation_id = ? AND invoice_type = ? AND fy = ?', orgId, type, fy);
+async function nextNumber(orgId, type, fy) { // organisation ids are already tenant-checked
+  const row = (await get('SELECT MAX(invoice_series_int) AS m FROM invoices WHERE organisation_id = ? AND invoice_type = ? AND fy = ?', orgId, type, fy));
   const n = (row?.m || 0) + 1;
   return { n, number: `INV/${fy}/${PREFIX[type]}/${String(n).padStart(4, '0')}` };
 }
 
-function refreshPaid(invoiceId) {
-  const inv = get('SELECT net_amount FROM invoices WHERE id = ?', invoiceId);
-  const paid = r2(get('SELECT COALESCE(SUM(amount),0) AS s FROM payments WHERE invoice_id = ?', invoiceId).s);
-  const credit = r2(get('SELECT COALESCE(SUM(total),0) AS s FROM credit_notes WHERE invoice_id = ?', invoiceId).s);
+async function refreshPaid(invoiceId) {
+  const inv = (await get('SELECT net_amount FROM invoices WHERE id = ?', invoiceId));
+  const paid = r2((await get('SELECT COALESCE(SUM(amount),0) AS s FROM payments WHERE invoice_id = ?', invoiceId)).s);
+  const credit = r2((await get('SELECT COALESCE(SUM(total),0) AS s FROM credit_notes WHERE invoice_id = ?', invoiceId)).s);
   const eff = r2(inv.net_amount - credit); // credit notes reduce what is owed
-  run('UPDATE invoices SET paid_amount = ?, credit_amount = ?, balance_amount = ?, payment_status = ? WHERE id = ?',
-    paid, credit, r2(eff - paid), eff <= 0.005 ? 'paid' : paymentStatus(eff, paid), invoiceId);
+  (await run('UPDATE invoices SET paid_amount = ?, credit_amount = ?, balance_amount = ?, payment_status = ? WHERE id = ?',
+    paid, credit, r2(eff - paid), eff <= 0.005 ? 'paid' : paymentStatus(eff, paid), invoiceId));
 }
 
-function insertItems(invoiceId, items) {
+async function insertItems(invoiceId, items) {
   for (const it of items) {
-    run(`INSERT INTO invoice_items (invoice_id, service_product_id, position, sac_number, description, price, quantity,
+    (await run(`INSERT INTO invoice_items (invoice_id, service_product_id, position, sac_number, description, price, quantity,
          gross_amount, discount_percent, discount_amount, selling_amount, tax, igst, cgst, sgst, total_amount)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       invoiceId, it.service_product_id, it.position, it.sac_number, it.description, it.price, it.quantity,
-      it.gross_amount, it.discount_percent, it.discount_amount, it.selling_amount, it.tax, it.igst, it.cgst, it.sgst, it.total_amount);
+      it.gross_amount, it.discount_percent, it.discount_amount, it.selling_amount, it.tax, it.igst, it.cgst, it.sgst, it.total_amount));
   }
 }
 
-function saveInvoice(tid, body, userId, id) {
-  const org = get('SELECT * FROM organisations WHERE id = ? AND tenant_id = ?', body.organisation_id, tid);
-  const client = get('SELECT * FROM clients WHERE id = ? AND tenant_id = ?', body.client_id, tid);
+async function saveInvoice(tid, body, userId, id) {
+  const org = (await get('SELECT * FROM organisations WHERE id = ? AND tenant_id = ?', body.organisation_id, tid));
+  const client = (await get('SELECT * FROM clients WHERE id = ? AND tenant_id = ?', body.client_id, tid));
   if (!org || !client) throw fail(400, 'Organisation and client are required');
   if (!Array.isArray(body.items) || !body.items.length) throw fail(400, 'Add at least one line item');
   if (body.items.some((i) => !(+i.quantity > 0) || !(+i.price >= 0))) throw fail(400, 'Every line needs a quantity and price');
-  const type = id ? (get('SELECT invoice_type FROM invoices WHERE id = ? AND tenant_id = ?', id, tid) || (() => { throw fail(404, 'Invoice not found'); })()).invoice_type : body.invoice_type;
+  const type = id ? ((await get('SELECT invoice_type FROM invoices WHERE id = ? AND tenant_id = ?', id, tid)) || (() => { throw fail(404, 'Invoice not found'); })()).invoice_type : body.invoice_type;
   if (!PREFIX[type]) throw fail(400, 'Invalid invoice type');
   const date = body.invoice_date || today();
   const orgCode = stateCode(org), clientCode = stateCode(client);
@@ -381,19 +393,19 @@ function saveInvoice(tid, body, userId, id) {
   ];
   const amounts = [t.gross, t.disc, t.sell, t.igst, t.cgst, t.sgst, +body.tds_percent || 0, t.tds_amount, t.total, t.net];
 
-  return tx(() => {
+  return (await tx(async () => {
     if (id) {
-      run(`UPDATE invoices SET invoice_date=?, due_date=?, organisation_id=?, client_id=?,
+      (await run(`UPDATE invoices SET invoice_date=?, due_date=?, organisation_id=?, client_id=?,
            org_name=?, org_address=?, org_email=?, org_contact=?, org_gst=?, org_bank=?,
            client_name=?, client_address=?, client_email=?, client_contact=?, client_gst=?, place_of_supply=?,
            gross_amount=?, discount_amount=?, selling_amount=?, igst=?, cgst=?, sgst=?, tds_percent=?, tds_amount=?,
            total_amount=?, net_amount=?, notes=? WHERE id=?`,
-        date, body.due_date || null, org.id, client.id, ...snap, ...amounts, body.notes || null, id);
-      run('DELETE FROM invoice_items WHERE invoice_id = ?', id);
+        date, body.due_date || null, org.id, client.id, ...snap, ...amounts, body.notes || null, id));
+      (await run('DELETE FROM invoice_items WHERE invoice_id = ?', id));
     } else {
       const fy = financialYear(date);
-      const { n, number } = nextNumber(org.id, type, fy);
-      id = run(`INSERT INTO invoices (tenant_id, created_by, invoice_type, invoice_number, invoice_series_int, fy, invoice_date, due_date,
+      const { n, number } = (await nextNumber(org.id, type, fy));
+      id = (await run(`INSERT INTO invoices (tenant_id, created_by, invoice_type, invoice_number, invoice_series_int, fy, invoice_date, due_date,
            organisation_id, client_id,
            org_name, org_address, org_email, org_contact, org_gst, org_bank,
            client_name, client_address, client_email, client_contact, client_gst, place_of_supply,
@@ -401,13 +413,13 @@ function saveInvoice(tid, body, userId, id) {
            notes, converted_from_id)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         tid, userId, type, number, n, fy, date, body.due_date || null, org.id, client.id, ...snap, ...amounts,
-        body.notes || null, body.converted_from_id || null).lastInsertRowid;
+        body.notes || null, body.converted_from_id || null)).lastInsertRowid;
     }
-    insertItems(id, items);
-    run('UPDATE invoices SET gst_applied = ?, pay_qr = ?, pay_upi = ?, pay_bank = ? WHERE id = ?', +gst, flag(body.pay_qr), flag(body.pay_upi), flag(body.pay_bank), id);
-    refreshPaid(id);
+    (await insertItems(id, items));
+    (await run('UPDATE invoices SET gst_applied = ?, pay_qr = ?, pay_upi = ?, pay_bank = ? WHERE id = ?', +gst, flag(body.pay_qr), flag(body.pay_upi), flag(body.pay_bank), id));
+    (await refreshPaid(id));
     return id;
-  });
+  }));
 }
 
 // UPI deep link; amount = what is still to be paid (tax) or the full total (proforma).
@@ -418,12 +430,12 @@ function upiLink(inv) {
   return `upi://pay?pa=${encodeURIComponent(pa)}&pn=${encodeURIComponent(inv.org_name || '')}&am=${r2(amt).toFixed(2)}&cu=INR&tn=${encodeURIComponent(inv.invoice_number)}`;
 }
 
-function invoiceDetail(id, tid) {
-  const inv = get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', id, tid);
+async function invoiceDetail(id, tid) {
+  const inv = (await get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', id, tid));
   if (!inv) throw fail(404, 'Invoice not found');
-  inv.items = all('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY position', id);
-  inv.payments = all('SELECT p.*, u.name AS by_name FROM payments p LEFT JOIN users u ON u.id = p.created_by WHERE invoice_id = ? ORDER BY paid_on, id', id);
-  const o = get('SELECT logo, signature, qr_image, footer_note, terms, upi_id, pan_number AS org_pan FROM organisations WHERE id = ?', inv.organisation_id) || {};
+  inv.items = (await all('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY position', id));
+  inv.payments = (await all('SELECT p.*, u.name AS by_name FROM payments p LEFT JOIN users u ON u.id = p.created_by WHERE invoice_id = ? ORDER BY paid_on, id', id));
+  const o = (await get('SELECT logo, signature, qr_image, footer_note, terms, upi_id, pan_number AS org_pan FROM organisations WHERE id = ?', inv.organisation_id)) || {};
   Object.assign(inv, { org_logo: o.logo, org_signature: o.signature, org_footer: o.footer_note, org_terms: o.terms, org_pan: o.org_pan });
   // Payment options chosen for this invoice: QR code, UPI id, bank transfer
   inv.gst_applied = !!inv.gst_applied;
@@ -434,12 +446,12 @@ function invoiceDetail(id, tid) {
   if (link) inv.upi_link = link;
   if (inv.pay_qr && /^data:image\/(png|jpeg|jpg|svg\+xml|webp);base64,[A-Za-z0-9+/=]+$/.test(o.qr_image || '')) inv.upi_qr = `<img src="${o.qr_image}" alt="Payment QR code">`;
   else if (inv.pay_qr && link) { const q = qrcode(0, 'M'); q.addData(link); q.make(); inv.upi_qr = q.createSvgTag({ cellSize: 4, margin: 0, scalable: true }); }
-  inv.credit_notes = all('SELECT * FROM credit_notes WHERE invoice_id = ? ORDER BY id', id);
+  inv.credit_notes = (await all('SELECT * FROM credit_notes WHERE invoice_id = ? ORDER BY id', id));
   inv.intra = inv.cgst > 0 || inv.sgst > 0;
   return inv;
 }
 
-api.get('/invoices', need('invoices.view'), wrap((req) => {
+api.get('/invoices', need('invoices.view'), wrap(async (req) => {
   const { type, status, q, client_id, from, to } = req.query;
   const w = ['i.tenant_id = ?'], p = [req.user.tid];
   if (type) { w.push('i.invoice_type = ?'); p.push(type); }
@@ -449,90 +461,90 @@ api.get('/invoices', need('invoices.view'), wrap((req) => {
   if (status === 'overdue') { w.push("i.balance_amount > 0.005 AND i.due_date < ? AND i.invoice_type = 'tax'"); p.push(today()); }
   else if (status) { w.push('i.payment_status = ?'); p.push(status); }
   if (q) { w.push('(i.invoice_number LIKE ? OR i.client_name LIKE ?)'); p.push(`%${q}%`, `%${q}%`); }
-  return all(`SELECT i.id, i.invoice_number, i.invoice_type, i.invoice_date, i.due_date, i.client_id, i.client_name,
+  return (await all(`SELECT i.id, i.invoice_number, i.invoice_type, i.invoice_date, i.due_date, i.client_id, i.client_name,
       i.total_amount, i.net_amount, i.paid_amount, i.balance_amount, i.payment_status, i.converted_to_id
-      FROM invoices i WHERE ${w.join(' AND ')} ORDER BY i.invoice_date DESC, i.id DESC LIMIT 500`, ...p);
+      FROM invoices i WHERE ${w.join(' AND ')} ORDER BY i.invoice_date DESC, i.id DESC LIMIT 500`, ...p));
 }));
-api.get('/invoices/:id', need('invoices.view'), wrap((req) => invoiceDetail(req.params.id, req.user.tid)));
-api.post('/invoices', need('invoices.create'), wrap((req) => {
-  const id = saveInvoice(req.user.tid, req.body, req.user.id);
-  const i = get('SELECT invoice_number, client_name, total_amount FROM invoices WHERE id = ?', id);
-  logAct(req.user, 'create', 'invoice', id, `${i.invoice_number} for ${i.client_name} (₹${i.total_amount})`);
+api.get('/invoices/:id', need('invoices.view'), wrap(async (req) => (await invoiceDetail(req.params.id, req.user.tid))));
+api.post('/invoices', need('invoices.create'), wrap(async (req) => {
+  const id = (await saveInvoice(req.user.tid, req.body, req.user.id));
+  const i = (await get('SELECT invoice_number, client_name, total_amount FROM invoices WHERE id = ?', id));
+  (await logAct(req.user, 'create', 'invoice', id, `${i.invoice_number} for ${i.client_name} (₹${i.total_amount})`));
   return { id };
 }));
-api.put('/invoices/:id', need('invoices.edit'), wrap((req) => {
-  const id = saveInvoice(req.user.tid, req.body, req.user.id, +req.params.id);
-  logAct(req.user, 'update', 'invoice', id, get('SELECT invoice_number FROM invoices WHERE id = ?', id).invoice_number);
+api.put('/invoices/:id', need('invoices.edit'), wrap(async (req) => {
+  const id = (await saveInvoice(req.user.tid, req.body, req.user.id, +req.params.id));
+  (await logAct(req.user, 'update', 'invoice', id, (await get('SELECT invoice_number FROM invoices WHERE id = ?', id)).invoice_number));
   return { id };
 }));
-api.delete('/invoices/:id', need('invoices.delete'), wrap((req) => {
-  const inv = get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
+api.delete('/invoices/:id', need('invoices.delete'), wrap(async (req) => {
+  const inv = (await get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid));
   if (!inv) throw fail(404, 'Not found');
-  if (inv.converted_from_id) run('UPDATE invoices SET converted_to_id = NULL WHERE id = ?', inv.converted_from_id);
-  run('DELETE FROM invoices WHERE id = ?', inv.id);
-  logAct(req.user, 'delete', 'invoice', +req.params.id, inv?.invoice_number);
+  if (inv.converted_from_id) (await run('UPDATE invoices SET converted_to_id = NULL WHERE id = ?', inv.converted_from_id));
+  (await run('DELETE FROM invoices WHERE id = ?', inv.id));
+  (await logAct(req.user, 'delete', 'invoice', +req.params.id, inv?.invoice_number));
   return { ok: true };
 }));
 
 // Proforma -> Tax invoice (copies items, links both)
-api.post('/invoices/:id/convert', need('invoices.create'), wrap((req) => {
-  const pi = invoiceDetail(req.params.id, req.user.tid);
+api.post('/invoices/:id/convert', need('invoices.create'), wrap(async (req) => {
+  const pi = (await invoiceDetail(req.params.id, req.user.tid));
   if (pi.invoice_type !== 'proforma') throw fail(400, 'Only proforma invoices can be converted');
   if (pi.converted_to_id) throw fail(400, 'Already converted');
-  const newId = saveInvoice(req.user.tid, {
+  const newId = (await saveInvoice(req.user.tid, {
     invoice_type: 'tax', invoice_date: today(), due_date: pi.due_date, organisation_id: pi.organisation_id,
     client_id: pi.client_id, items: pi.items, tds_percent: pi.tds_percent, notes: pi.notes, converted_from_id: pi.id,
     gst_applied: pi.gst_applied, pay_qr: pi.pay_qr, pay_upi: pi.pay_upi, pay_bank: pi.pay_bank,
-  }, req.user.id);
-  run('UPDATE invoices SET converted_to_id = ? WHERE id = ?', newId, pi.id);
-  logAct(req.user, 'convert', 'invoice', newId, `${pi.invoice_number} → tax invoice`);
+  }, req.user.id));
+  (await run('UPDATE invoices SET converted_to_id = ? WHERE id = ?', newId, pi.id));
+  (await logAct(req.user, 'convert', 'invoice', newId, `${pi.invoice_number} → tax invoice`));
   return { id: newId };
 }));
 
-api.post('/invoices/:id/payments', need('payments.create'), wrap((req) => {
-  const inv = get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
+api.post('/invoices/:id/payments', need('payments.create'), wrap(async (req) => {
+  const inv = (await get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid));
   if (!inv) throw fail(404, 'Not found');
   if (inv.invoice_type !== 'tax') throw fail(400, 'Record payments against the tax invoice');
   const amount = r2(req.body.amount);
   if (!(amount > 0)) throw fail(400, 'Enter a valid amount');
   if (amount > inv.balance_amount + 0.005) throw fail(400, `Amount is more than the balance (${inv.balance_amount})`);
-  tx(() => {
-    run('INSERT INTO payments (invoice_id, amount, paid_on, mode, reference, notes, created_by) VALUES (?,?,?,?,?,?,?)',
-      inv.id, amount, req.body.paid_on || today(), req.body.mode || null, req.body.reference || null, req.body.notes || null, req.user.id);
-    refreshPaid(inv.id);
-  });
-  logAct(req.user, 'payment', 'invoice', inv.id, `₹${amount} received on ${inv.invoice_number}`);
-  return invoiceDetail(inv.id, req.user.tid);
+  (await tx(async () => {
+    (await run('INSERT INTO payments (invoice_id, amount, paid_on, mode, reference, notes, created_by) VALUES (?,?,?,?,?,?,?)',
+      inv.id, amount, req.body.paid_on || today(), req.body.mode || null, req.body.reference || null, req.body.notes || null, req.user.id));
+    (await refreshPaid(inv.id));
+  }));
+  (await logAct(req.user, 'payment', 'invoice', inv.id, `₹${amount} received on ${inv.invoice_number}`));
+  return (await invoiceDetail(inv.id, req.user.tid));
 }));
-api.delete('/payments/:id', need('payments.delete'), wrap((req) => {
-  const p = get('SELECT p.* FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.id = ? AND i.tenant_id = ?', req.params.id, req.user.tid);
+api.delete('/payments/:id', need('payments.delete'), wrap(async (req) => {
+  const p = (await get('SELECT p.* FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.id = ? AND i.tenant_id = ?', req.params.id, req.user.tid));
   if (!p) throw fail(404, 'Not found');
-  tx(() => { run('DELETE FROM payments WHERE id = ?', p.id); refreshPaid(p.invoice_id); });
-  logAct(req.user, 'delete', 'payment', p.id, `₹${p.amount} removed`);
+  (await tx(async () => { (await run('DELETE FROM payments WHERE id = ?', p.id)); (await refreshPaid(p.invoice_id)); }));
+  (await logAct(req.user, 'delete', 'payment', p.id, `₹${p.amount} removed`));
   return { ok: true };
 }));
 
 // Every payment received, newest first (ledger view)
-api.get('/payments', need('invoices.view'), wrap((req) => {
+api.get('/payments', need('invoices.view'), wrap(async (req) => {
   const from = req.query.from || '0000-01-01', to = req.query.to || '9999-12-31';
-  const rows = all(`SELECT p.id, p.amount, p.paid_on, p.mode, p.reference, p.notes, i.id AS invoice_id, i.invoice_number, i.client_id, i.client_name,
+  const rows = (await all(`SELECT p.id, p.amount, p.paid_on, p.mode, p.reference, p.notes, i.id AS invoice_id, i.invoice_number, i.client_id, i.client_name,
       i.net_amount, i.balance_amount FROM payments p JOIN invoices i ON i.id = p.invoice_id
-      WHERE i.tenant_id = ? AND p.paid_on BETWEEN ? AND ? ORDER BY p.paid_on DESC, p.id DESC LIMIT 500`, req.user.tid, from, to);
+      WHERE i.tenant_id = ? AND p.paid_on BETWEEN ? AND ? ORDER BY p.paid_on DESC, p.id DESC LIMIT 500`, req.user.tid, from, to));
   const byMode = {};
   for (const r of rows) byMode[r.mode || 'Other'] = r2((byMode[r.mode || 'Other'] || 0) + r.amount);
   return { rows, total: r2(rows.reduce((s, r) => s + r.amount, 0)), byMode };
 }));
 
-api.post('/invoices/:id/share', need('invoices.view'), wrap((req) => {
-  const inv = get('SELECT id, invoice_number, share_token FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid);
+api.post('/invoices/:id/share', need('invoices.view'), wrap(async (req) => {
+  const inv = (await get('SELECT id, invoice_number, share_token FROM invoices WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid));
   if (!inv) throw fail(404, 'Not found');
   const token = inv.share_token || crypto.randomBytes(16).toString('hex');
-  if (!inv.share_token) { run('UPDATE invoices SET share_token = ? WHERE id = ?', token, inv.id); logAct(req.user, 'share', 'invoice', inv.id, `${inv.invoice_number} link created`); }
+  if (!inv.share_token) { (await run('UPDATE invoices SET share_token = ? WHERE id = ?', token, inv.id)); (await logAct(req.user, 'share', 'invoice', inv.id, `${inv.invoice_number} link created`)); }
   return { url: `${req.protocol}://${req.get('host')}/p/${token}` };
 }));
-api.delete('/invoices/:id/share', need('invoices.edit'), wrap((req) => {
-  if (!run('UPDATE invoices SET share_token = NULL WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid).changes) throw fail(404, 'Not found');
-  logAct(req.user, 'unshare', 'invoice', +req.params.id, 'link disabled');
+api.delete('/invoices/:id/share', need('invoices.edit'), wrap(async (req) => {
+  if (!(await run('UPDATE invoices SET share_token = NULL WHERE id = ? AND tenant_id = ?', req.params.id, req.user.tid)).changes) throw fail(404, 'Not found');
+  (await logAct(req.user, 'unshare', 'invoice', +req.params.id, 'link disabled'));
   return { ok: true };
 }));
 
@@ -549,53 +561,53 @@ function monthsBetween(from, to) {
   return out.slice(0, 60);
 }
 
-function revenueReport(tid, from, to) {
+async function revenueReport(tid, from, to) {
   const t = today();
-  const billed = get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_amount),0) AS total, COALESCE(SUM(selling_amount),0) AS taxable,
+  const billed = (await get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_amount),0) AS total, COALESCE(SUM(selling_amount),0) AS taxable,
       COALESCE(SUM(igst+cgst+sgst),0) AS gst, COALESCE(SUM(tds_amount),0) AS tds
-      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ?`, tid, from, to);
-  const collected = get(`SELECT COALESCE(SUM(p.amount),0) AS s FROM payments p JOIN invoices i ON i.id=p.invoice_id
-      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND p.paid_on BETWEEN ? AND ?`, tid, from, to).s;
-  const recv = get(`SELECT COUNT(*) AS n, COALESCE(SUM(balance_amount),0) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, tid);
-  const overdue = get(`SELECT COUNT(*) AS n, COALESCE(SUM(balance_amount),0) AS s FROM invoices
-      WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005 AND due_date < ?`, tid, t);
-  const proforma = get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_amount),0) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='proforma' AND converted_to_id IS NULL AND invoice_date BETWEEN ? AND ?`, tid, from, to);
+      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ?`, tid, from, to));
+  const collected = (await get(`SELECT COALESCE(SUM(p.amount),0) AS s FROM payments p JOIN invoices i ON i.id=p.invoice_id
+      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND p.paid_on BETWEEN ? AND ?`, tid, from, to)).s;
+  const recv = (await get(`SELECT COUNT(*) AS n, COALESCE(SUM(balance_amount),0) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, tid));
+  const overdue = (await get(`SELECT COUNT(*) AS n, COALESCE(SUM(balance_amount),0) AS s FROM invoices
+      WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005 AND due_date < ?`, tid, t));
+  const proforma = (await get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_amount),0) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='proforma' AND converted_to_id IS NULL AND invoice_date BETWEEN ? AND ?`, tid, from, to));
 
-  const bm = Object.fromEntries(all(`SELECT substr(invoice_date,1,7) AS m, SUM(total_amount) AS s FROM invoices
-      WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? GROUP BY m`, tid, from, to).map((r) => [r.m, r.s]));
-  const cm = Object.fromEntries(all(`SELECT substr(p.paid_on,1,7) AS m, SUM(p.amount) AS s FROM payments p JOIN invoices i ON i.id=p.invoice_id
-      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND p.paid_on BETWEEN ? AND ? GROUP BY m`, tid, from, to).map((r) => [r.m, r.s]));
+  const bm = Object.fromEntries((await all(`SELECT substr(invoice_date,1,7) AS m, SUM(total_amount) AS s FROM invoices
+      WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? GROUP BY m`, tid, from, to)).map((r) => [r.m, r.s]));
+  const cm = Object.fromEntries((await all(`SELECT substr(p.paid_on,1,7) AS m, SUM(p.amount) AS s FROM payments p JOIN invoices i ON i.id=p.invoice_id
+      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND p.paid_on BETWEEN ? AND ? GROUP BY m`, tid, from, to)).map((r) => [r.m, r.s]));
   const monthly = monthsBetween(from, to).map((m) => ({ month: m, billed: r2(bm[m]), collected: r2(cm[m]) }));
 
-  const topClients = all(`SELECT client_id, client_name AS name, COUNT(*) AS invoices, SUM(total_amount) AS billed, SUM(balance_amount) AS pending
-      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? GROUP BY client_id ORDER BY billed DESC LIMIT 5`, tid, from, to);
+  const topClients = (await all(`SELECT client_id, MAX(client_name) AS name, COUNT(*) AS invoices, SUM(total_amount) AS billed, SUM(balance_amount) AS pending
+      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? GROUP BY client_id ORDER BY billed DESC LIMIT 5`, tid, from, to));
 
   const aging = { current: 0, d30: 0, d60: 0, d90: 0 };
-  for (const r of all(`SELECT balance_amount, due_date FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, tid)) {
+  for (const r of (await all(`SELECT balance_amount, due_date FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, tid))) {
     const days = r.due_date ? Math.floor((Date.parse(t) - Date.parse(r.due_date)) / 864e5) : 0;
     const k = days <= 0 ? 'current' : days <= 30 ? 'd30' : days <= 60 ? 'd60' : 'd90';
     aging[k] = r2(aging[k] + r.balance_amount);
   }
-  const recentPayments = all(`SELECT p.id, p.amount, p.paid_on, p.mode, i.id AS invoice_id, i.invoice_number, i.client_name
-      FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE i.tenant_id = ? ORDER BY p.paid_on DESC, p.id DESC LIMIT 6`, tid);
-  const credits = r2(get('SELECT COALESCE(SUM(total),0) AS s FROM credit_notes WHERE tenant_id = ? AND note_date BETWEEN ? AND ?', tid, from, to).s);
+  const recentPayments = (await all(`SELECT p.id, p.amount, p.paid_on, p.mode, i.id AS invoice_id, i.invoice_number, i.client_name
+      FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE i.tenant_id = ? ORDER BY p.paid_on DESC, p.id DESC LIMIT 6`, tid));
+  const credits = r2((await get('SELECT COALESCE(SUM(total),0) AS s FROM credit_notes WHERE tenant_id = ? AND note_date BETWEEN ? AND ?', tid, from, to)).s);
   billed.total = r2(billed.total - credits); billed.credits = credits;
-  const expenses = get('SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS n FROM expenses WHERE tenant_id = ? AND date BETWEEN ? AND ?', tid, from, to);
-  const expenseByCat = all("SELECT COALESCE(NULLIF(category,''),'Other') AS category, SUM(amount) AS s FROM expenses WHERE tenant_id = ? AND date BETWEEN ? AND ? GROUP BY 1 ORDER BY s DESC LIMIT 5", tid, from, to);
-  const dueWeek = all(`SELECT i.id, i.invoice_number, i.client_id, i.client_name, i.due_date, i.balance_amount FROM invoices i
-      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.balance_amount > 0.005 AND i.due_date BETWEEN ? AND ? ORDER BY i.due_date LIMIT 8`, tid, t, new Date(Date.parse(t) + 7 * 864e5).toISOString().slice(0, 10));
-  const overdueBy = Object.fromEntries(all(`SELECT client_id, SUM(balance_amount) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005 AND due_date < ? GROUP BY client_id`, tid, t).map((r) => [r.client_id, r.s]));
-  const slowPayers = all(`SELECT i.client_id, i.client_name AS name, COUNT(*) AS invoices, AVG(julianday(lp.d) - julianday(i.invoice_date)) AS avg_days
+  const expenses = (await get('SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS n FROM expenses WHERE tenant_id = ? AND date BETWEEN ? AND ?', tid, from, to));
+  const expenseByCat = (await all("SELECT COALESCE(NULLIF(category,''),'Other') AS category, SUM(amount) AS s FROM expenses WHERE tenant_id = ? AND date BETWEEN ? AND ? GROUP BY 1 ORDER BY s DESC LIMIT 5", tid, from, to));
+  const dueWeek = (await all(`SELECT i.id, i.invoice_number, i.client_id, i.client_name, i.due_date, i.balance_amount FROM invoices i
+      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.balance_amount > 0.005 AND i.due_date BETWEEN ? AND ? ORDER BY i.due_date LIMIT 8`, tid, t, new Date(Date.parse(t) + 7 * 864e5).toISOString().slice(0, 10)));
+  const overdueBy = Object.fromEntries((await all(`SELECT client_id, SUM(balance_amount) AS s FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005 AND due_date < ? GROUP BY client_id`, tid, t)).map((r) => [r.client_id, r.s]));
+  const slowPayers = (await all(`SELECT i.client_id, MAX(i.client_name) AS name, COUNT(*) AS invoices, AVG(julianday(lp.d) - julianday(i.invoice_date)) AS avg_days
       FROM invoices i JOIN (SELECT invoice_id, MAX(paid_on) AS d FROM payments GROUP BY invoice_id) lp ON lp.invoice_id = i.id
-      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.payment_status='paid' GROUP BY i.client_id ORDER BY avg_days DESC LIMIT 5`, tid)
+      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.payment_status='paid' GROUP BY i.client_id ORDER BY avg_days DESC LIMIT 5`, tid))
     .map((r) => ({ ...r, avg_days: Math.round(r.avg_days), overdue: r2(overdueBy[r.client_id] || 0) }));
   return { from, to, billed, collected: r2(collected), receivable: recv, overdue, proforma, monthly, topClients, aging, recentPayments,
     expenses: { total: r2(expenses.s), count: expenses.n, byCategory: expenseByCat }, net: r2(collected - expenses.s), dueWeek, slowPayers };
 }
 
-api.get('/dashboard', need('dashboard.view'), wrap((req) => {
+api.get('/dashboard', need('dashboard.view'), wrap(async (req) => {
   const d = fyRange();
-  return revenueReport(req.user.tid, req.query.from || d.from, req.query.to || d.to);
+  return (await revenueReport(req.user.tid, req.query.from || d.from, req.query.to || d.to));
 }));
 
 const csvCell = (v) => {
@@ -608,19 +620,19 @@ function sendCsv(res, filename, header, rows) {
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send('﻿' + body); // BOM so Excel reads UTF-8
 }
-api.get('/export/revenue.csv', need('dashboard.export'), wrap((req, res) => {
+api.get('/export/revenue.csv', need('dashboard.export'), wrap(async (req, res) => {
   const d = fyRange();
   const from = req.query.from || d.from, to = req.query.to || d.to;
-  const rows = all(`SELECT invoice_date, invoice_number, client_name, client_gst, selling_amount, igst, cgst, sgst, total_amount,
+  const rows = (await all(`SELECT invoice_date, invoice_number, client_name, client_gst, selling_amount, igst, cgst, sgst, total_amount,
       tds_amount, net_amount, paid_amount, balance_amount, payment_status, due_date
-      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? ORDER BY invoice_date, id`, req.user.tid, from, to);
+      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND invoice_date BETWEEN ? AND ? ORDER BY invoice_date, id`, req.user.tid, from, to));
   sendCsv(res, `revenue_${from}_to_${to}.csv`,
     ['Date', 'Invoice No', 'Client', 'Client GST', 'Taxable Value', 'IGST', 'CGST', 'SGST', 'Total', 'TDS', 'Net Receivable', 'Paid', 'Balance', 'Status', 'Due Date'],
     rows.map((r) => Object.values(r)));
 }));
-api.get('/export/invoices.csv', need('invoices.export'), wrap((req, res) => {
-  const rows = all(`SELECT invoice_number, invoice_type, invoice_date, due_date, client_name, total_amount, paid_amount, balance_amount, payment_status
-      FROM invoices WHERE tenant_id = ? ORDER BY invoice_date DESC, id DESC`, req.user.tid);
+api.get('/export/invoices.csv', need('invoices.export'), wrap(async (req, res) => {
+  const rows = (await all(`SELECT invoice_number, invoice_type, invoice_date, due_date, client_name, total_amount, paid_amount, balance_amount, payment_status
+      FROM invoices WHERE tenant_id = ? ORDER BY invoice_date DESC, id DESC`, req.user.tid));
   sendCsv(res, 'invoices.csv', ['Invoice No', 'Type', 'Date', 'Due Date', 'Client', 'Total', 'Paid', 'Balance', 'Status'], rows.map((r) => Object.values(r)));
 }));
 
@@ -629,21 +641,21 @@ const daysOver = (due) => (due ? Math.max(0, Math.floor((Date.parse(today()) - D
 const inr = (n) => 'Rs. ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtDate = (d) => (d ? d.split('-').reverse().join('-') : '');
 
-function pendingInvoices(tid, clientId) {
-  return all(`SELECT id, invoice_number, invoice_date, due_date, total_amount, balance_amount, org_name, org_contact, organisation_id
+async function pendingInvoices(tid, clientId) {
+  return (await all(`SELECT id, invoice_number, invoice_date, due_date, total_amount, balance_amount, org_name, org_contact, organisation_id
       FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005 ${clientId ? 'AND client_id = ?' : ''}
-      ORDER BY due_date`, tid, ...(clientId ? [clientId] : []));
+      ORDER BY due_date`, tid, ...(clientId ? [clientId] : [])));
 }
 
-api.get('/reminders', need('reminders.view'), wrap((req) => {
-  const rows = all(`SELECT i.client_id, i.id, i.invoice_number, i.due_date, i.balance_amount, i.total_amount,
+api.get('/reminders', need('reminders.view'), wrap(async (req) => {
+  const rows = (await all(`SELECT i.client_id, i.id, i.invoice_number, i.due_date, i.balance_amount, i.total_amount,
       c.name, c.mobile, c.email, c.contact_person
       FROM invoices i JOIN clients c ON c.id = i.client_id
-      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.balance_amount > 0.005 ORDER BY i.due_date`, req.user.tid);
+      WHERE i.tenant_id = ? AND i.invoice_type='tax' AND i.balance_amount > 0.005 ORDER BY i.due_date`, req.user.tid));
   const map = new Map();
   for (const r of rows) {
     if (!map.has(r.client_id)) {
-      const last = get('SELECT created_at, channel FROM reminder_log WHERE client_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 1', r.client_id, req.user.tid);
+      const last = (await get('SELECT created_at, channel FROM reminder_log WHERE client_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 1', r.client_id, req.user.tid));
       map.set(r.client_id, { client_id: r.client_id, name: r.name, mobile: r.mobile, email: r.email, contact_person: r.contact_person,
         pending_count: 0, total_pending: 0, overdue_count: 0, max_days_overdue: 0, last_reminded: last?.created_at || null, invoices: [] });
     }
@@ -656,26 +668,26 @@ api.get('/reminders', need('reminders.view'), wrap((req) => {
   return [...map.values()].sort((a, b) => b.max_days_overdue - a.max_days_overdue || b.total_pending - a.total_pending);
 }));
 
-api.get('/reminders/summary', wrap((req) => {
+api.get('/reminders/summary', wrap(async (req) => {
   if (!hasPerm(req.user.perms, 'reminders.view')) return { overdue_count: 0, pending_count: 0, total_pending: 0 };
-  const r = get(`SELECT COUNT(*) AS pending_count, COALESCE(SUM(balance_amount),0) AS total_pending,
+  const r = (await get(`SELECT COUNT(*) AS pending_count, COALESCE(SUM(balance_amount),0) AS total_pending,
       COALESCE(SUM(CASE WHEN due_date < ? THEN 1 ELSE 0 END),0) AS overdue_count
-      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, today(), req.user.tid);
-  return { ...r, queue_count: reminderQueue(req.user.tid).length };
+      FROM invoices WHERE tenant_id = ? AND invoice_type='tax' AND balance_amount > 0.005`, today(), req.user.tid));
+  return { ...r, queue_count: (await reminderQueue(req.user.tid)).length };
 }));
 
 // Render a template for a client (all pending) and optionally one invoice.
-api.post('/messages/render', wrap((req) => {
+api.post('/messages/render', wrap(async (req) => {
   const { template_id, client_id, invoice_id } = req.body;
   const tid = req.user.tid;
-  const tpl = get('SELECT * FROM message_templates WHERE id = ? AND tenant_id = ?', template_id, tid);
+  const tpl = (await get('SELECT * FROM message_templates WHERE id = ? AND tenant_id = ?', template_id, tid));
   if (!tpl) throw fail(404, 'Template not found');
-  const inv = invoice_id ? get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', invoice_id, tid) : null;
+  const inv = invoice_id ? (await get('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?', invoice_id, tid)) : null;
   if (invoice_id && !inv) throw fail(404, 'Invoice not found');
-  const client = get('SELECT * FROM clients WHERE id = ? AND tenant_id = ?', client_id || inv?.client_id, tid);
+  const client = (await get('SELECT * FROM clients WHERE id = ? AND tenant_id = ?', client_id || inv?.client_id, tid));
   if (!client) throw fail(400, 'Client not found');
-  const pend = pendingInvoices(tid, client.id);
-  const org = inv ? get('SELECT * FROM organisations WHERE id = ?', inv.organisation_id) : get('SELECT * FROM organisations WHERE tenant_id = ? ORDER BY id LIMIT 1', tid);
+  const pend = (await pendingInvoices(tid, client.id));
+  const org = inv ? (await get('SELECT * FROM organisations WHERE id = ?', inv.organisation_id)) : (await get('SELECT * FROM organisations WHERE tenant_id = ? ORDER BY id LIMIT 1', tid));
   const total = r2(pend.reduce((s, x) => s + x.balance_amount, 0));
   const vars = {
     client_name: client.name, contact_person: client.contact_person || client.name,
@@ -692,16 +704,16 @@ api.post('/messages/render', wrap((req) => {
   };
   if (inv && /invoice_link/.test(tpl.body + (tpl.subject || ''))) {
     let tok = inv.share_token;
-    if (!tok) { tok = crypto.randomBytes(16).toString('hex'); run('UPDATE invoices SET share_token = ? WHERE id = ?', tok, inv.id); }
+    if (!tok) { tok = crypto.randomBytes(16).toString('hex'); (await run('UPDATE invoices SET share_token = ? WHERE id = ?', tok, inv.id)); }
     vars.invoice_link = `${req.protocol}://${req.get('host')}/p/${tok}`;
   }
-  const pay = req.body.payment_id ? get('SELECT p.* FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.id = ? AND i.tenant_id = ?', req.body.payment_id, tid) : null;
+  const pay = req.body.payment_id ? (await get('SELECT p.* FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.id = ? AND i.tenant_id = ?', req.body.payment_id, tid)) : null;
   if (pay) Object.assign(vars, { payment_amount: inr(pay.amount), payment_date: fmtDate(pay.paid_on), payment_mode: pay.mode || '', payment_reference: pay.reference || '' });
   const fill = (s) => (s || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => (vars[k] ?? ''));
   const text = fill(tpl.body), subject = fill(tpl.subject);
   let mobile = (client.mobile || '').replace(/\D/g, '');
   if (mobile.length === 10) mobile = '91' + mobile;
-  const cc = all('SELECT email FROM email_notify WHERE tenant_id = ?', tid).map((r) => r.email).join(',');
+  const cc = (await all('SELECT email FROM email_notify WHERE tenant_id = ?', tid)).map((r) => r.email).join(',');
   const to = inv?.client_email || client.email || '';
   return {
     channel: tpl.channel, text, subject, to_email: to, cc, mobile,
@@ -709,14 +721,14 @@ api.post('/messages/render', wrap((req) => {
     mailto_url: `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}${cc ? `&cc=${encodeURIComponent(cc)}` : ''}`,
   };
 }));
-api.get('/messages/templates', wrap((req) => all('SELECT * FROM message_templates WHERE tenant_id = ? ORDER BY channel, kind, name', req.user.tid)));
-api.post('/messages/log', need('reminders.send'), wrap((req) => {
+api.get('/messages/templates', wrap(async (req) => (await all('SELECT * FROM message_templates WHERE tenant_id = ? ORDER BY channel, kind, name', req.user.tid))));
+api.post('/messages/log', need('reminders.send'), wrap(async (req) => {
   const tid = req.user.tid;
-  if (req.body.client_id && !get('SELECT 1 AS x FROM clients WHERE id = ? AND tenant_id = ?', req.body.client_id, tid)) throw fail(404, 'Client not found');
-  if (req.body.invoice_id && !get('SELECT 1 AS x FROM invoices WHERE id = ? AND tenant_id = ?', req.body.invoice_id, tid)) throw fail(404, 'Invoice not found');
-  run('INSERT INTO reminder_log (tenant_id, client_id, invoice_id, channel, template_id, sent_by, rule) VALUES (?,?,?,?,?,?,?)',
-    tid, req.body.client_id, req.body.invoice_id || null, req.body.channel, req.body.template_id, req.user.id, req.body.rule ?? null);
-  logAct(req.user, 'sent', 'message', req.body.invoice_id || req.body.client_id, `${req.body.channel} message opened`);
+  if (req.body.client_id && !(await get('SELECT 1 AS x FROM clients WHERE id = ? AND tenant_id = ?', req.body.client_id, tid))) throw fail(404, 'Client not found');
+  if (req.body.invoice_id && !(await get('SELECT 1 AS x FROM invoices WHERE id = ? AND tenant_id = ?', req.body.invoice_id, tid))) throw fail(404, 'Invoice not found');
+  (await run('INSERT INTO reminder_log (tenant_id, client_id, invoice_id, channel, template_id, sent_by, rule) VALUES (?,?,?,?,?,?,?)',
+    tid, req.body.client_id, req.body.invoice_id || null, req.body.channel, req.body.template_id, req.user.id, req.body.rule ?? null));
+  (await logAct(req.user, 'sent', 'message', req.body.invoice_id || req.body.client_id, `${req.body.channel} message opened`));
   return { ok: true };
 }));
 
@@ -724,17 +736,22 @@ api.post('/messages/log', need('reminders.send'), wrap((req) => {
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(express.static(path.join(__dirname, '..', 'public'), { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') })); // always revalidate, so updates show without a hard refresh
 
-seedIfEmpty({ saveInvoice, refreshPaid, hashPassword });
-ensureManagement(hashPassword);
-ensureManagementWorkspace();
-normalizeRoles();
-ensureDefaults();
-ensureRolePerms();
-ensureTaskPerms();
-const { reminderQueue } = initFeatures({ api, need, wrap, fail, crud, saveInvoice, invoiceDetail, refreshPaid });
+(await seedIfEmpty({ saveInvoice, refreshPaid, hashPassword }));
+(await ensureManagement(hashPassword));
+(await ensureManagementWorkspace());
+(await normalizeRoles());
+(await ensureDefaults());
+(await ensureRolePerms());
+(await ensureTaskPerms());
+const { reminderQueue, runDue } = initFeatures({ api, need, wrap, fail, crud, saveInvoice, invoiceDetail, refreshPaid });
+runRecurring = runDue;
 registerGst({ api, need, wrap });
 registerTasks({ api, need, wrap, fail });
 export const voice = registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState, saveInvoice }); // exported for tests (voice._test)
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Invoice app running on http://localhost:${port}`));
+// On Vercel the app is a serverless function (api/index.js) and Vercel handles the requests; elsewhere it listens itself.
+export default app;
+if (!process.env.VERCEL) {
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log(`Invoice app running on http://localhost:${port}`));
+}

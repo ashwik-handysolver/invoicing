@@ -8,8 +8,12 @@ revenue tracker with CSV export. Mobile-first UI.
 npm install
 npm start          # http://localhost:3000
 ```
-Needs Node 22.5+ (uses built-in `node:sqlite`; data in `invoice.db`). First run seeds demo data:
-login `admin@example.com` / `admin123` — change it under Settings.
+Needs Node 22.5+. Data lives in **Supabase Postgres**: put the project's connection string in `.env` as `SUPABASE_DB_URL`
+(Supabase → Connect → Session pooler, with your database password). The server creates the tables on start (`supabase/schema.sql`).
+On an empty database the first run seeds demo data: login `admin@example.com` / `admin123` — change it under Settings.
+
+Moving from the old local SQLite file? Run `npm run db:copy` once **before** the first `npm start`: it copies everything from
+`invoice.db` (read-only) into Supabase, keeping ids, and refuses to run twice.
 
 ## Configuration
 Settings and keys go in a `.env` file in the project root (copy `.env.example`). It is git-ignored and loaded automatically on start; variables set in the shell override it. Restart the server after editing it.
