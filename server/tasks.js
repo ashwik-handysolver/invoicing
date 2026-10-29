@@ -26,7 +26,7 @@ export async function ensureTaskPerms() {
 const ASSIGNED_TO = (uidParam = '?') => `EXISTS (SELECT 1 FROM task_assignees a WHERE a.task_id = t.id AND a.user_id = ${uidParam})`;
 // Which tasks a user can see: admins see every task in the organisation, everyone else only the tasks
 // they created or that are assigned to them. Use on any query over `tasks t`.
-export const taskScope = (u) => (u.isAdmin ? { sql: '1', params: [] } : { sql: `(t.assigned_by = ? OR ${ASSIGNED_TO()})`, params: [u.id, u.id] });
+export const taskScope = (u) => (u.isAdmin ? { sql: 'TRUE', params: [] } : { sql: `(t.assigned_by = ? OR ${ASSIGNED_TO()})`, params: [u.id, u.id] });
 export const assignedToSql = ASSIGNED_TO;
 export const isAssignee = async (taskId, uid) => !!(await get('SELECT 1 AS x FROM task_assignees WHERE task_id = ? AND user_id = ?', taskId, uid));
 // attach `assignees: [{ id, name }]` to task rows
