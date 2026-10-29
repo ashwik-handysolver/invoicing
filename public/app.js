@@ -200,6 +200,21 @@ const NAV = [
   { id: 'management', label: 'Dashboard', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management', sec: 'top' },
   { id: 'organisations', label: 'Organisations', icon: 'users', perm: 'management.view', hash: '#/organisations', grp: 'Management', sec: 'top' },
 ];
+// The referral app linked from the "Refer & earn" button. It is told who is referring:
+// ?referrerEmail=…&referrerName=… (the user's name, else the part of the email before the @).
+const REFERRAL_URL = 'https://referral-umber.vercel.app/';
+function referralUrl() {
+  const email = S.user?.email || '';
+  if (!email) return REFERRAL_URL;
+  const name = (S.user.name || '').trim() || email.split('@')[0];
+  return `${REFERRAL_URL}?${new URLSearchParams({ referrerEmail: email, referrerName: name })}`;
+}
+// On hover a sheen sweeps across, the gift hops and three sparkles twinkle one after another.
+const SPARKLES = [{ x: -11, y: -11, s: 7, d: 0 }, { x: 12, y: -9, s: 5, d: 90 }, { x: 10, y: 11, s: 6, d: 170 }];
+const referButton = (cls = '') => `<a class="refer-btn ${cls}" href="${esc(referralUrl())}" target="_blank" rel="noopener noreferrer" aria-label="Refer and earn (opens the referral app in a new tab)">
+  <span class="refer-ic"><span class="refer-sparks" aria-hidden="true">${SPARKLES.map((p) => `<i style="--x:${p.x}px;--y:${p.y}px;--s:${p.s}px;--d:${p.d}ms"></i>`).join('')}</span><span class="refer-gift">${ic('gift', 20, 2.2)}</span></span>
+  <span class="refer-lb">Refer &amp; earn</span><span class="refer-arrow">${ic('arrowUpRight', 14, 2.4)}</span></a>`;
+
 function renderShell() {
   const items = NAV.filter((n) => !n.inSettings && !n.inHeader &&(n.anyPerm ? n.anyPerm.some(can) : n.perm ? can(n.perm) : !!S.user.membership && S.user.membership.status === 'approved'));
   const settingsOk = ['settings.view', 'users.view', 'templates.view', 'activity.view'].some(can);
@@ -214,7 +229,8 @@ function renderShell() {
       ${items.filter((n) => n.sec === 'top').map((n) => link(n, 'nav')).join('')}
       ${SECS.map((sec) => { const its = items.filter((n) => (n.sec || 'invoicing') === sec.id); if (!its.length) return ''; const o = isOpen(sec.id);
         return `<div class="navdd ${o ? 'open' : ''}" data-sec="${sec.id}"><button type="button" class="navdd-h" aria-expanded="${o}"><span class="ico">${ic(sec.icon)}</span><span class="lb">${sec.l}</span><span class="chev">${ic('chevron', 16)}</span></button>
-        <div class="navdd-b"><div class="navdd-in">${its.map((n, i) => (sec.id !== 'invoicing' || (i && its[i - 1].grp === n.grp) ? '' : `<div class="navgrp">${n.grp}</div>`) + link(n, 'nav')).join('')}</div></div></div>`; }).join('')}<div class="grow"></div></aside>
+        <div class="navdd-b"><div class="navdd-in">${its.map((n, i) => (sec.id !== 'invoicing' || (i && its[i - 1].grp === n.grp) ? '' : `<div class="navgrp">${n.grp}</div>`) + link(n, 'nav')).join('')}</div></div></div>`; }).join('')}<div class="grow"></div>
+      ${referButton()}</aside>
     <div class="main"><header class="top"><div class="title" id="pt"></div>
       ${S.user.membership?.status === 'approved' ? `<button class="searchpill" id="gs" aria-label="Search">${ic('search', 17)}<span>Search invoices, clients…</span><kbd>Ctrl K</kbd></button>` : '<span class="grow"></span>'}
       ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new?type=tax">${ic('plus')} Invoice</a>` : ''}
@@ -328,6 +344,7 @@ function openAccount() {
 }
 function openMore(items) {
   const m = modal(`<h2>Menu</h2><div class="moregrid">${items.map((n) => `<a class="moretile ${location.hash.startsWith(n.hash) ? 'on' : ''}" href="${n.hash}">${ic(n.icon)}<span>${n.label}</span>${n.badge && S.badge ? `<span class="badge">${S.badge}</span>` : ''}</a>`).join('')}</div>
+    ${referButton('wide')}
     <div class="sheetfoot">${avatar(S.user.name, 'sm')}<div class="who">${esc(S.user.name)}<small>${esc(S.user.role)}</small></div>
       <button class="ibtn" data-theme-btn aria-label="Toggle theme">${themeIcon()}</button><button class="btn" id="mso">${ic('logout')} Sign out</button></div>`);
   $$('.moretile', m.el).forEach((a) => (a.onclick = () => m.close()));

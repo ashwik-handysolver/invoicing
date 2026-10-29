@@ -377,3 +377,31 @@ table.mgmt td, table.mgmt th { white-space: nowrap; } table.mgmt code { font-siz
 .vx-retry { margin-top: 8px; background: var(--surface); color: var(--bad); border-color: var(--bad-soft); } .vx-retry:hover { border-color: var(--bad); }
 
 .mail-via { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 12px; } .mail-via .btn.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+
+/* ---------- refer & earn (sidebar bottom + mobile More menu) ---------- */
+.refer-btn { position: relative; isolation: isolate; display: flex; align-items: center; gap: 10px; height: 44px; padding: 0 12px; margin: 10px 0 4px;
+  border-radius: 12px; overflow: hidden; color: #fff; font-weight: 600; font-size: 14px; text-decoration: none;
+  background: linear-gradient(135deg, var(--brand), #6a5cff); box-shadow: 0 10px 22px -10px var(--brand), inset 0 0 0 1px rgba(255,255,255,.15);
+  transition: box-shadow .2s, filter .2s; }
+.refer-btn:hover { filter: brightness(1.05); box-shadow: 0 14px 26px -10px var(--brand), inset 0 0 0 1px rgba(255,255,255,.2); color: #fff; }
+.refer-btn:focus-visible { outline: 3px solid var(--brand-soft); outline-offset: 2px; }
+.refer-btn::after { content: ''; position: absolute; inset: 0; z-index: -1; transform: translateX(-120%);
+  background: linear-gradient(105deg, transparent 30%, rgba(255,255,255,.35) 50%, transparent 70%); }
+.refer-btn:hover::after { animation: refer-sheen .7s ease-out; }
+.refer-ic { position: relative; display: grid; place-items: center; width: 20px; height: 20px; flex: none; }
+.refer-btn:hover .refer-gift { animation: refer-hop .45s ease-out; }
+.refer-gift { display: grid; }
+.refer-sparks { position: absolute; inset: 0; pointer-events: none; }
+.refer-sparks i { position: absolute; left: 50%; top: 50%; width: var(--s); height: var(--s); margin: calc(var(--s) / -2) 0 0 calc(var(--s) / -2);
+  transform: translate(var(--x), var(--y)) scale(0); opacity: 0; background: #fff;
+  clip-path: polygon(50% 0, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0 50%, 38% 38%); }
+.refer-btn:hover .refer-sparks i { animation: refer-spark .55s ease-out var(--d) both; }
+.refer-lb { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.refer-arrow { display: grid; opacity: .7; transition: transform .3s, opacity .3s; }
+.refer-btn:hover .refer-arrow { opacity: 1; transform: translate(2px, -2px); }
+.refer-btn.wide { margin: 14px 0 0; height: 48px; }
+@keyframes refer-sheen { to { transform: translateX(120%); } }
+@keyframes refer-hop { 0%, 100% { transform: translateY(0) rotate(0); } 40% { transform: translateY(-4px) rotate(-8deg); } 70% { transform: translateY(0) rotate(4deg); } }
+@keyframes refer-spark { 0% { opacity: 0; transform: translate(var(--x), var(--y)) scale(0); } 50% { opacity: 1; transform: translate(var(--x), var(--y)) scale(1) rotate(45deg); } 100% { opacity: 0; transform: translate(var(--x), var(--y)) scale(.4) rotate(90deg); } }
+@media (prefers-reduced-motion: reduce) { .refer-btn:hover::after, .refer-btn:hover .refer-gift, .refer-btn:hover .refer-sparks i { animation: none; } }
+.side .refer-btn { flex: none; }
