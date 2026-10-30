@@ -284,7 +284,7 @@ async function refreshBadge() {
   $$('[data-badge]').forEach((b) => { b.textContent = n > 9 ? '9+' : n; b.classList.toggle('hidden', !n); });
 }
 async function loadNotifs(el) {
-  el.innerHTML = '<div class="empty small">Loading…</div>';
+  el.innerHTML = skRows(3, 'flat sk-notif');
   const d = await bellData(), seen = pSeen(), out = [];
   const payRow = (r) => `<a class="notif" href="#/invoices/${r.id}"><div><b>${esc(r.client_name)}</b><small class="muted">${esc(r.invoice_number)} · ${money(r.balance_amount)}</small></div><span class="pill ${r.diff > 0 ? 'overdue' : 'partial'}">${esc(r.label)}</span></a>`;
   const taskRow = (t) => `<a class="notif" href="#/tasks"><div><b>${esc(t.title)}</b><small class="muted">${t.assigned_by && t.assigned_by !== S.user.id ? `From ${esc(t.assigned_by_name || '')} · ` : ''}${t.priority} priority</small></div><span class="pill ${t.due_date < d.t0 ? 'overdue' : 'partial'}">${t.due_date < d.t0 ? `${Math.round((new Date(d.t0) - new Date(t.due_date)) / 864e5)}d overdue` : 'Due today'}</span></a>`;
@@ -370,6 +370,27 @@ async function boot() {
   route();
 }
 
+/* ------------------------------------------------------------ loading placeholders */
+// Grey shimmering shapes laid out like the page that is loading, so the screen doesn't jump when data arrives.
+const skBar = (w, h = 12, cls = '') => `<i class="sk ${cls}" style="width:${w};height:${h}px"></i>`;
+const skHead = () => `<div class="sk-head"><div>${skBar('90px', 10)}${skBar('220px', 22)}</div>${skBar('120px', 38, 'r')}</div>`;
+const skRows = (n, cls = '') => `<div class="card sk-list ${cls}">${Array.from({ length: n }, (_, i) => `<div class="sk-row"><i class="sk sk-av"></i><div class="sk-mid">${skBar(`${55 + ((i * 17) % 30)}%`, 12)}${skBar(`${30 + ((i * 11) % 25)}%`, 10)}</div>${skBar('70px', 14)}</div>`).join('')}</div>`;
+function skeleton(kind) {
+  if (kind === 'dashboard') return `<div class="sk-wrap" aria-busy="true" aria-label="Loading">${skHead()}
+    <div class="sk-grid"><div class="card sk-hero">${skBar('120px', 11)}${skBar('55%', 34)}${skBar('40%', 11)}<div class="sk-chips">${skBar('110px', 26, 'r')}${skBar('90px', 26, 'r')}</div></div>
+      <div class="sk-tiles">${Array.from({ length: 4 }, () => `<div class="card sk-tile"><i class="sk sk-ic"></i><div>${skBar('60px', 10)}${skBar('90px', 18)}${skBar('70px', 9)}</div></div>`).join('')}</div></div>
+    <div class="sk-grid two"><div class="card">${skBar('140px', 14)}<div class="sk-chart">${Array.from({ length: 12 }, (_, i) => `<i class="sk" style="height:${30 + ((i * 37) % 60)}%"></i>`).join('')}</div></div>${skRows(5, 'flat')}</div></div>`;
+  if (kind === 'detail') return `<div class="sk-wrap" aria-busy="true" aria-label="Loading">${skHead()}
+    <div class="card sk-doc"><div class="sk-doc-top"><div>${skBar('160px', 18)}${skBar('110px', 11)}</div>${skBar('90px', 11)}</div>
+      <div class="sk-doc-cols"><div>${skBar('80px', 9)}${skBar('70%', 12)}${skBar('55%', 11)}</div><div>${skBar('80px', 9)}${skBar('70%', 12)}${skBar('55%', 11)}</div></div>
+      ${Array.from({ length: 4 }, () => `<div class="sk-line">${skBar('45%', 12)}${skBar('60px', 12)}</div>`).join('')}
+      <div class="sk-total">${skBar('140px', 20)}</div></div></div>`;
+  if (kind === 'cards') return `<div class="sk-wrap" aria-busy="true" aria-label="Loading">${skHead()}<div class="sk-cards">${Array.from({ length: 6 }, () => `<div class="card">${skBar('70%', 14)}${skBar('90%', 10)}${skBar('50%', 10)}<div class="sk-chips">${skBar('64px', 22, 'r')}${skBar('84px', 22, 'r')}</div></div>`).join('')}</div></div>`;
+  return `<div class="sk-wrap" aria-busy="true" aria-label="Loading">${skHead()}<div class="sk-toolbar">${skBar('260px', 38, 'r')}${skBar('90px', 38, 'r')}${skBar('90px', 38, 'r')}</div>${skRows(8)}</div>`;
+}
+const skeletonFor = (path) => (/^#\/(dashboard|management)$/.test(path) ? 'dashboard'
+  : /^#\/(invoices\/(\d+|new)|credit-notes\/\d+)/.test(path) ? 'detail' : /^#\/(tasks|organisations)$/.test(path) ? 'cards' : 'list');
+
 /* ------------------------------------------------------------ router */
 const routes = [
   [/^#\/dashboard$/, 'dashboard', 'dashboard.view', viewDashboard],
@@ -407,7 +428,7 @@ async function route() {
     $('#pt').textContent = /invoices\/new/.test(path) ? 'New invoice' : /invoices\/\d+\/edit/.test(path) ? 'Edit invoice' : /invoices\/\d+/.test(path) ? 'Invoice' : /credit-notes/.test(path) ? 'Credit note' : NAV.find((n) => n.id === nav)?.label || '';
     const fab = $('#fab'); if (fab) fab.classList.toggle('hidden', !['dashboard', 'invoices', 'payments', 'reminders'].includes(nav) || /new|edit|invoices\/\d/.test(path));
     view.classList.remove('still'); // page change: let the fade-in run
-    view.innerHTML = '<div class="empty">Loading…</div>';
+    view.innerHTML = skeleton(skeletonFor(path));
     window.scrollTo(0, 0);
     try { await fn(view, m, q); } catch (e) { view.innerHTML = `<div class="empty card">${esc(e.message)}</div>`; }
     return;
@@ -1548,7 +1569,7 @@ async function viewSettings(el, tab) {
 /* ------------------------------------------------------------ public client page (/p/<token>) */
 async function publicView(token) {
   const app = $('#app');
-  app.innerHTML = '<div class="pub"><div class="empty">Loading invoice…</div></div>';
+  app.innerHTML = `<div class="pub">${skeleton('detail')}</div>`;
   try {
     const res = await fetch('/api/public/invoice/' + encodeURIComponent(token));
     const v = await res.json();
