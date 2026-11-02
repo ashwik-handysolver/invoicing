@@ -232,7 +232,7 @@ const NAV = [
   { id: 'templates', label: 'Templates', icon: 'chat', perm: 'templates.view', hash: '#/templates', grp: 'Setup', inSettings: true },
   { id: 'users', label: 'Users', icon: 'user', perm: 'users.view', hash: '#/users', grp: 'Admin', inSettings: true },
   { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', anyPerm: ['settings.view', 'users.view', 'templates.view', 'activity.view'], hash: '#/settings', grp: 'Admin', inSettings: true },
-  { id: 'taskdash', label: 'Dashboard', icon: 'chart', perm: 'tasks.view', hash: '#/tasks/dashboard', grp: 'Tasks', sec: 'tasks' },
+  { id: 'taskdash', label: 'Dashboard', short: 'Task dashboard', icon: 'clipboard', perm: 'tasks.view', hash: '#/tasks/dashboard', grp: 'Tasks', sec: 'tasks' },
   { id: 'tasks', label: 'Tasks', icon: 'check', perm: 'tasks.view', hash: '#/tasks', grp: 'Tasks', sec: 'tasks' },
   { id: 'management', label: 'Dashboard', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management', sec: 'top' },
   { id: 'organisations', label: 'Organisations', icon: 'users', perm: 'management.view', hash: '#/organisations', grp: 'Management', sec: 'top' },
@@ -259,7 +259,14 @@ function renderShell() {
   const SECS = [{ id: 'invoicing', l: 'Invoicing', icon: 'file' }, { id: 'tasks', l: 'Task management', icon: 'clipboard' }];
   const isOpen = (id) => { try { return localStorage.getItem('nav:' + id) !== '0'; } catch { return true; } };
   const link = (n, cls) => `<a class="${cls}" data-nav="${n.id}" href="${n.hash}"><span class="ico">${ic(n.icon)}</span><span class="lb">${n.label}</span>${n.badge ? '<span class="badge hidden" data-badge></span>' : ''}</a>`;
-  const bottom = ['dashboard', 'invoices', 'payments'] /* + centre mic + More (Reminders etc. are in More) */.map((id) => items.find((n) => n.id === id)).filter(Boolean);
+  // mobile tab bar: invoicing tabs, or the task tabs when invoicing is off; mic in the centre, More last
+  const pick = (ids) => ids.map((id) => items.find((n) => n.id === id)).filter(Boolean);
+  // task-only organisations have nothing else to put in More, so the last slot is Refer & earn instead
+  const sales = pick(['dashboard', 'invoices', 'payments']);
+  const bottom = (sales.length ? sales : pick(['taskdash', 'tasks'])).map((n) => link({ ...n, label: n.short || n.label }, ''))
+    .concat(sales.length ? `<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a>`
+      : `<a class="tab-refer" href="${esc(referralUrl())}" target="_blank" rel="noopener noreferrer" aria-label="Refer and earn (opens the referral app in a new tab)"><span class="ico">${ic('gift')}</span><span class="lb">Refer</span></a>`);
+  const half = Math.ceil(bottom.length / 2);
   $('#app').innerHTML = `<div class="shell">
     <aside class="side"><div class="brand">${LOGO} Invoice Manager</div>
       ${S.user.membership?.status === 'approved' ? `<button type="button" class="side-mic" data-mic aria-label="Voice"><span>${ic('mic', 22, 2.6)}</span>Voice</button>` : ''}
@@ -278,11 +285,11 @@ function renderShell() {
         <div class="um-pop" role="menu"><div class="um-who"><b>${esc(S.user.name)}</b><small class="muted">${esc(S.user.role)}${S.user.membership?.organisation ? ` · ${esc(S.user.membership.organisation)}` : ''}</small></div>
           <button type="button" role="menuitem" id="acct">${ic('user', 17)} My account</button><button type="button" role="menuitemcheckbox" aria-checked="false" data-push-btn>${ic('bell', 17)} Notifications<span class="um-state">Off</span></button>${settingsOk ? `<a role="menuitem" href="#/settings">${ic('gear', 17)} Settings</a>` : ''}<button type="button" role="menuitem" class="um-logout" id="so">${ic('logout', 17)} Log out</button></div></div></header>
       <main class="content" id="view"></main></div>
-    <nav class="bottom">${bottom.slice(0, 2).map((n) => link(n, '')).join('')}${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}${bottom.slice(2).map((n) => link(n, '')).join('')}<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a></nav>
+    <nav class="bottom"><div class="bt-half">${bottom.slice(0, half).join('')}</div>${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}<div class="bt-half">${bottom.slice(half).join('')}</div></nav>
     ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
   $('#acct').onclick = () => { umSet(false); openAccount(); };
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
-  $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
+  if ($('#more')) $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
   if ($('#gs')) $('#gs').onclick = openSearch;
   const um = $('#um'), umb = $('.um-btn', um), umSet = (o) => { um.classList.toggle('open', o); umb.setAttribute('aria-expanded', o); };
   umb.onclick = (e) => { e.stopPropagation(); umSet(!um.classList.contains('open')); paintPushBtn(); };
@@ -380,7 +387,7 @@ function openAccount() {
   $('#ac-n', m.el).focus();
 }
 function openMore(items) {
-  const m = modal(`<h2>Menu</h2><div class="moregrid">${items.map((n) => `<a class="moretile ${location.hash.startsWith(n.hash) ? 'on' : ''}" href="${n.hash}">${ic(n.icon)}<span>${n.label}</span>${n.badge && S.badge ? `<span class="badge">${S.badge}</span>` : ''}</a>`).join('')}</div>
+  const m = modal(`<h2>Menu</h2><div class="moregrid">${items.map((n) => `<a class="moretile ${location.hash === n.hash || location.hash.startsWith(n.hash + '/') && !items.some((o) => o.hash.length > n.hash.length && location.hash.startsWith(o.hash)) ? 'on' : ''}" href="${n.hash}">${ic(n.icon)}<span>${n.short || n.label}</span>${n.badge && S.badge ? `<span class="badge">${S.badge}</span>` : ''}</a>`).join('')}</div>
     ${referButton('wide')}
     <div class="sheetfoot">${avatar(S.user.name, 'sm')}<div class="who">${esc(S.user.name)}<small>${esc(S.user.role)}</small></div>
       <button class="ibtn" data-theme-btn aria-label="Toggle theme">${themeIcon()}</button><button class="btn" id="mso">${ic('logout')} Sign out</button></div>`);
@@ -464,7 +471,7 @@ async function route() {
     if (!m) continue;
     $$('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === nav));
     if (perm && !can(perm)) { view.innerHTML = '<div class="empty card">You don\'t have access to this page.</div>'; return; }
-    $('#pt').textContent = /invoices\/new/.test(path) ? 'New invoice' : /invoices\/\d+\/edit/.test(path) ? 'Edit invoice' : /invoices\/\d+/.test(path) ? 'Invoice' : /credit-notes/.test(path) ? 'Credit note' : NAV.find((n) => n.id === nav)?.label || '';
+    $('#pt').textContent = /invoices\/new/.test(path) ? 'New invoice' : /invoices\/\d+\/edit/.test(path) ? 'Edit invoice' : /invoices\/\d+/.test(path) ? 'Invoice' : /credit-notes/.test(path) ? 'Credit note' : (({ short, label } = {}) => (short && matchMedia('(max-width: 760px)').matches ? short : label) || '')(NAV.find((n) => n.id === nav));
     const fab = $('#fab'); if (fab) fab.classList.toggle('hidden', !['dashboard', 'invoices', 'payments', 'reminders'].includes(nav) || /new|edit|invoices\/\d/.test(path));
     view.classList.remove('still'); // page change: let the fade-in run
     view.innerHTML = skeleton(skeletonFor(path));
@@ -559,7 +566,7 @@ async function openSearch() {
     can('payments.create') && { ic: 'rupee', t: 'Record a payment', fn: () => pickInvoiceForPayment(() => route()) },
     can('clients.create') && { ic: 'users', t: 'Add client', fn: () => crudForm(CFG.clients, null, () => route()) },
   ].filter(Boolean);
-  const pages = NAV.filter((n) => !n.perm || can(n.perm)).map((n) => ({ ic: n.icon, t: n.label, h: n.hash, s: 'Go to page' }));
+  const pages = NAV.filter((n) => !n.perm || can(n.perm)).map((n) => ({ ic: n.icon, t: n.short || n.label, h: n.hash, s: 'Go to page' }));
   let cur = [], idx = 0, seq = 0;
   const paint = () => {
     $('#sr', m.el).innerHTML = cur.length ? cur.map((r, i) => `<div class="sr-i ${i === idx ? 'on' : ''}" data-i="${i}"><span class="sr-ic">${ic(r.ic, 17)}</span><div class="mid"><div class="t">${esc(r.t)}</div>${r.s ? `<div class="s">${esc(r.s)}</div>` : ''}</div>${r.r ? `<b class="amt">${r.r}</b>` : ''}</div>`).join('') : '<div class="empty">Nothing found.</div>';

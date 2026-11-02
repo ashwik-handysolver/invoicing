@@ -343,7 +343,11 @@ table.mgmt td, table.mgmt th { white-space: nowrap; } table.mgmt code { font-siz
 .side-mic:hover { transform: translateY(-1px); box-shadow: 0 14px 26px -10px var(--brand); } .side-mic:focus-visible { outline: 3px solid var(--brand-soft); outline-offset: 2px; }
 .tab-mic { display: none; }
 @media (max-width: 760px) {
-  .tab-mic { display: flex; flex: 1; justify-content: center; align-items: flex-start; min-width: 0; padding: 0; border: 0; background: none; cursor: pointer; }
+  /* two equal halves keep the mic in the middle whatever the number of tabs */
+  .bottom .bt-half { flex: 1; display: flex; min-width: 0; }
+  .bottom .bt-half > a { flex: 1; min-width: 0; }
+  .bottom a.tab-refer { color: var(--brand); }
+  .tab-mic { display: flex; flex: 0 0 72px; justify-content: center; align-items: flex-start; min-width: 0; padding: 0; border: 0; background: none; cursor: pointer; }
   .tab-mic span { display: grid; place-items: center; width: 56px; height: 56px; margin-top: -22px; border: 4px solid var(--bg); border-radius: 50%; color: #fff; background: linear-gradient(135deg, var(--brand), #6a5cff); box-shadow: 0 12px 24px -8px var(--brand); }
   .tab-mic:active span { transform: scale(.95); }
 }
