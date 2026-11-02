@@ -347,6 +347,10 @@ table.mgmt td, table.mgmt th { white-space: nowrap; } table.mgmt code { font-siz
   .bottom .bt-half { flex: 1; display: flex; min-width: 0; }
   .bottom .bt-half > a { flex: 1; min-width: 0; }
   .bottom a.tab-refer { color: var(--brand); }
+  /* uneven sides (task-only: 2 tabs, mic, Refer): every slot the same width instead */
+  .bottom.bt-even .bt-half { display: contents; }
+  .bottom.bt-even .tab-mic { flex: 1 1 0; padding: 0 2px; } /* same side padding as the tab links */
+  .bottom.bt-even .bt-half > a { flex: 1 1 0; }
   .tab-mic { display: flex; flex: 0 0 72px; justify-content: center; align-items: flex-start; min-width: 0; padding: 0; border: 0; background: none; cursor: pointer; }
   .tab-mic span { display: grid; place-items: center; width: 56px; height: 56px; margin-top: -22px; border: 4px solid var(--bg); border-radius: 50%; color: #fff; background: linear-gradient(135deg, var(--brand), #6a5cff); box-shadow: 0 12px 24px -8px var(--brand); }
   .tab-mic:active span { transform: scale(.95); }

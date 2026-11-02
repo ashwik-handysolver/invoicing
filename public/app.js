@@ -285,7 +285,7 @@ function renderShell() {
         <div class="um-pop" role="menu"><div class="um-who"><b>${esc(S.user.name)}</b><small class="muted">${esc(S.user.role)}${S.user.membership?.organisation ? ` · ${esc(S.user.membership.organisation)}` : ''}</small></div>
           <button type="button" role="menuitem" id="acct">${ic('user', 17)} My account</button><button type="button" role="menuitemcheckbox" aria-checked="false" data-push-btn>${ic('bell', 17)} Notifications<span class="um-state">Off</span></button>${settingsOk ? `<a role="menuitem" href="#/settings">${ic('gear', 17)} Settings</a>` : ''}<button type="button" role="menuitem" class="um-logout" id="so">${ic('logout', 17)} Log out</button></div></div></header>
       <main class="content" id="view"></main></div>
-    <nav class="bottom"><div class="bt-half">${bottom.slice(0, half).join('')}</div>${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}<div class="bt-half">${bottom.slice(half).join('')}</div></nav>
+    <nav class="bottom ${bottom.length % 2 ? 'bt-even' : ''}"><div class="bt-half">${bottom.slice(0, half).join('')}</div>${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}<div class="bt-half">${bottom.slice(half).join('')}</div></nav>
     ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
   $('#acct').onclick = () => { umSet(false); openAccount(); };
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
