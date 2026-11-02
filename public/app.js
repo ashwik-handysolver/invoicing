@@ -234,6 +234,7 @@ const NAV = [
   { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', anyPerm: ['settings.view', 'users.view', 'templates.view', 'activity.view'], hash: '#/settings', grp: 'Admin', inSettings: true },
   { id: 'taskdash', label: 'Dashboard', short: 'Task dashboard', icon: 'clipboard', perm: 'tasks.view', hash: '#/tasks/dashboard', grp: 'Tasks', sec: 'tasks' },
   { id: 'tasks', label: 'Tasks', icon: 'check', perm: 'tasks.view', hash: '#/tasks', grp: 'Tasks', sec: 'tasks' },
+  { id: 'taskreport', label: 'Assigned by me', tab: 'Report', icon: 'send', perm: 'tasks.view', hash: '#/tasks/assigned', grp: 'Tasks', sec: 'tasks' },
   { id: 'management', label: 'Dashboard', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management', sec: 'top' },
   { id: 'organisations', label: 'Organisations', icon: 'users', perm: 'management.view', hash: '#/organisations', grp: 'Management', sec: 'top' },
 ];
@@ -263,7 +264,7 @@ function renderShell() {
   const pick = (ids) => ids.map((id) => items.find((n) => n.id === id)).filter(Boolean);
   // task-only organisations have nothing else to put in More, so the last slot is Refer & earn instead
   const sales = pick(['dashboard', 'invoices', 'payments']);
-  const bottom = (sales.length ? sales : pick(['taskdash', 'tasks'])).map((n) => link({ ...n, label: n.short || n.label }, ''))
+  const bottom = (sales.length ? sales : pick(['taskdash', 'tasks', 'taskreport'])).map((n) => link({ ...n, label: n.tab || n.short || n.label }, ''))
     .concat(sales.length ? `<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a>`
       : `<a class="tab-refer" href="${esc(referralUrl())}" target="_blank" rel="noopener noreferrer" aria-label="Refer and earn (opens the referral app in a new tab)"><span class="ico">${ic('gift')}</span><span class="lb">Refer</span></a>`);
   const half = Math.ceil(bottom.length / 2);
@@ -278,6 +279,7 @@ function renderShell() {
     <div class="main"><header class="top"><div class="title" id="pt"></div>
       ${S.user.membership?.status === 'approved' ? `<button class="searchpill" id="gs" aria-label="Search">${ic('search', 17)}<span>Search invoices, clients…</span><kbd>Ctrl K</kbd></button>` : '<span class="grow"></span>'}
       ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new">${ic('plus')} Invoice</a>` : ''}
+      ${can('tasks.create') && S.user.membership?.status === 'approved' ? `<button type="button" class="ibtn top-addtask" id="tnew" aria-label="Add task" title="Add task">${ic('plus', 20, 2.6)}</button>` : ''}
       ${Object.values(bellSources()).some(Boolean) ? `<div class="usermenu" id="bm"><button type="button" class="ibtn bellbtn" aria-haspopup="menu" aria-expanded="false" aria-label="Notifications" title="Notifications">${ic('bell', 18)}<span class="badge hidden" data-badge></span></button>
         <div class="um-pop notif-pop" role="menu"><div class="um-who"><b>Notifications</b></div><div class="notif-list"></div>${can('reminders.view') ? '<a class="notif-all" href="#/reminders">View all reminders</a>' : ''}</div></div>` : ''}
       <button class="ibtn" data-theme-btn aria-label="Toggle light / dark theme">${themeIcon()}</button>
@@ -291,6 +293,8 @@ function renderShell() {
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
   if ($('#more')) $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
   if ($('#gs')) $('#gs').onclick = openSearch;
+  // phone header "+": new task; task pages redraw so it shows up straight away
+  if ($('#tnew')) $('#tnew').onclick = () => crudForm(CFG.tasks, null, () => /^#\/tasks/.test(location.hash) && route());
   const um = $('#um'), umb = $('.um-btn', um), umSet = (o) => { um.classList.toggle('open', o); umb.setAttribute('aria-expanded', o); };
   umb.onclick = (e) => { e.stopPropagation(); umSet(!um.classList.contains('open')); paintPushBtn(); };
   $('.um-pop', um).onclick = (e) => { if (e.target.closest('a')) umSet(false); };
@@ -458,6 +462,7 @@ const routes = [
   [/^#\/organisations$/, 'organisations', 'management.view', viewOrgControl],
   [/^#\/tasks$/, 'tasks', 'tasks.view', viewTasks],
   [/^#\/tasks\/dashboard$/, 'taskdash', 'tasks.view', viewTaskDashboard],
+  [/^#\/tasks\/assigned$/, 'taskreport', 'tasks.view', viewAssignedByMe],
   [/^#\/management$/, 'management', 'management.view', viewManagement],
 ];
 async function route() {
@@ -1497,11 +1502,13 @@ function pickMenu(anchor, opts, cur, onPick, { multi = false } = {}) {
 }
 // Tasks page filters: a view tab plus search / status / priority (kept while you move around the app)
 const TASK_F = { tab: 'all', q: '', status: '', priority: '' };
-const TASK_TABS = [{ v: 'all', l: 'All tasks' }, { v: 'mine', l: 'Assigned to me' }, { v: 'byme', l: 'Assigned by me' }, { v: 'overdue', l: 'Overdue' }, { v: 'completed', l: 'Completed' }];
+// (tasks you assigned have their own report: #/tasks/assigned)
+const TASK_TABS = [{ v: 'all', l: 'All tasks' }, { v: 'mine', l: 'Assigned to me' }, { v: 'overdue', l: 'Overdue' }, { v: 'completed', l: 'Completed' }];
 async function viewTasks(el) {
   const all_ = await api('/tasks'), me = S.user.id, F = TASK_F, t0 = todayStr();
   const mine = (r) => r.assignees.some((a) => a.id === me);
-  const inTab = (r, tab) => ({ all: true, mine: mine(r), byme: r.assigned_by === me, overdue: r.status === 'overdue', completed: r.status === 'completed' }[tab]);
+  if (!TASK_TABS.some((t) => t.v === F.tab)) F.tab = 'all';
+  const inTab = (r, tab) => ({ all: true, mine: mine(r), overdue: r.status === 'overdue', completed: r.status === 'completed' }[tab]);
   const q = F.q.trim().toLowerCase();
   const rows = all_.filter((r) => inTab(r, F.tab) && (!F.status || r.status === F.status) && (!F.priority || r.priority === F.priority)
     && (!q || [r.title, r.description, r.assigned_by_name, ...r.assignees.map((a) => a.name)].some((v) => (v || '').toLowerCase().includes(q))));
@@ -1532,7 +1539,7 @@ async function viewTasks(el) {
     ? `<button type="button" class="tperson tpick" data-id="${r.id}" data-k="assignees" aria-haspopup="listbox" aria-expanded="false" aria-label="Assigned to: ${esc(r.assignees.map((a) => a.name).join(', ') || 'Unassigned')}">${peopleChips(r.assignees)}${caret}</button>`
     : `<div class="tperson">${peopleChips(r.assignees)}</div>`);
   el.innerHTML = `<div class="pagehead"><h1>Tasks</h1>
-      ${can('tasks.create') ? `<button class="btn primary" id="add">${ic('plus')} Add task</button>` : ''}</div>
+      ${can('tasks.create') ? `<button class="btn primary task-add" id="add">${ic('plus')} Add task</button>` : ''}</div>
     ${all_.length ? `<div class="ttabs" role="tablist">${TASK_TABS.map((t) => `<button type="button" role="tab" aria-selected="${F.tab === t.v}" class="${F.tab === t.v ? 'on' : ''}" data-tab="${t.v}">${t.v === 'all' && !S.user.isAdmin ? 'My tasks' : t.l}<span class="tcount">${all_.filter((r) => inTab(r, t.v)).length}</span></button>`).join('')}</div>
     <div class="tfilters"><label class="tsearch">${ic('search', 16)}<input id="tq" type="search" placeholder="Search tasks or people…" value="${esc(F.q)}" aria-label="Search tasks"></label>
       ${fbtn('status', 'Status', TASK_ST)}${fbtn('priority', 'Priority', TASK_PRI)}
@@ -1584,6 +1591,89 @@ async function viewTasks(el) {
   })));
 }
 
+/* ------------------------------------------------------------ report: tasks assigned by me */
+const ABM_F = { q: '', status: '', priority: '', who: '', due: '', from: '', to: '' };
+const DUE_F = [{ v: 'overdue', l: 'Overdue' }, { v: 'today', l: 'Due today' }, { v: 'week', l: 'Next 7 days' }, { v: 'month', l: 'This month' }, { v: 'none', l: 'No due date' }, { v: 'custom', l: 'Custom range' }];
+async function viewAssignedByMe(el) {
+  const me = S.user.id, F = ABM_F, t0 = todayStr();
+  const list = (await api('/tasks')).filter((r) => r.assigned_by === me);
+  const in7 = ymd(new Date(Date.now() + 7 * 864e5)), month = t0.slice(0, 7);
+  // everyone you've assigned something to (plus "Unassigned" when it applies)
+  const people = [...new Map(list.flatMap((r) => r.assignees).map((a) => [String(a.id), a.name])).entries()].sort((a, b) => a[1].localeCompare(b[1])).map(([v, l]) => ({ v, l }));
+  if (list.some((r) => !r.assignees.length)) people.push({ v: '0', l: 'Unassigned' });
+  const dueOk = (r) => { const d = r.due_date;
+    switch (F.due) {
+      case 'overdue': return r.status === 'overdue';
+      case 'today': return d === t0;
+      case 'week': return !!d && d >= t0 && d <= in7;
+      case 'month': return !!d && d.startsWith(month);
+      case 'none': return !d;
+      case 'custom': return !!d && (!F.from || d >= F.from) && (!F.to || d <= F.to);
+      default: return true;
+    } };
+  const q = F.q.trim().toLowerCase();
+  const rows = list.filter((r) => (!F.status || r.status === F.status) && (!F.priority || r.priority === F.priority) && dueOk(r)
+    && (!F.who || (F.who === '0' ? !r.assignees.length : r.assignees.some((a) => String(a.id) === F.who)))
+    && (!q || [r.title, r.description, ...r.assignees.map((a) => a.name)].some((v) => (v || '').toLowerCase().includes(q))));
+  const n = (st) => rows.filter((r) => r.status === st).length, open = rows.filter(taskOpen).length;
+  const active = rows.length - n('paused'), pct = active ? Math.round((n('completed') / active) * 100) : 0;
+  const pg = paginate(['abm', F.status, F.priority, F.who, F.due, F.from, F.to].join('-'), rows);
+  const caret = '<svg class="tcaret" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+  const dot = (k, v) => (k === 'status' || k === 'priority' ? `<span class="pm-c ${k}-${v}"><span class="tdot"></span></span>` : '');
+  const FOPTS = { status: TASK_ST, priority: TASK_PRI, who: people, due: DUE_F };
+  const fbtn = (k, l) => { const cur = FOPTS[k].find((o) => o.v === F[k]);
+    return `<button type="button" class="tfbtn ${cur ? 'set' : ''}" data-f="${k}" aria-haspopup="listbox" aria-expanded="false">${cur ? dot(k, cur.v) : ''}<span class="tf-l">${l}</span><b>${cur ? esc(cur.l) : 'All'}</b>${caret}</button>`; };
+  const pill = (k, v, opts) => `<span class="tpill ro ${k}-${esc(v)}"><span class="tdot"></span>${opts.find((o) => o.v === v)?.l || ''}</span>`;
+  const due = (r) => {
+    if (!r.due_date) return '<span class="muted">—</span>';
+    const days = Math.round((new Date(r.due_date) - new Date(t0)) / 864e5);
+    const note = !taskOpen(r) ? '' : days < 0 ? `<small class="tlate">${-days}d overdue</small>` : days === 0 ? '<small class="tsoon">Due today</small>' : days <= 3 ? `<small class="tsoon">In ${days}d</small>` : '';
+    return `<div class="tdue">${dmy(r.due_date)}${note}</div>`;
+  };
+  const tile = (icn, tone, label, val, sub) => `<div class="stat ${tone}"><span class="stat-ic">${ic(icn, 19)}</span><div class="stat-b"><div class="stat-l">${label}</div><div class="stat-v">${val}</div><div class="stat-s">${sub}</div></div></div>`;
+  const filtered = F.q || F.status || F.priority || F.who || F.due;
+  el.innerHTML = `<div class="pagehead"><h1>Assigned by me</h1>
+      <div class="row">${rows.length ? `<button class="btn" id="abx">${ic('download')} Export</button>` : ''}${can('tasks.create') ? `<button class="btn primary task-add" id="add">${ic('plus')} Add task</button>` : ''}</div></div>
+    ${list.length ? `<div class="tfilters"><label class="tsearch">${ic('search', 16)}<input id="tq" type="search" placeholder="Search tasks or people…" value="${esc(F.q)}" aria-label="Search tasks"></label>
+      ${fbtn('status', 'Status')}${fbtn('priority', 'Priority')}${fbtn('who', 'Assigned to')}${fbtn('due', 'Due')}
+      ${filtered ? '<button type="button" class="btn sm" id="tclr">Clear</button>' : ''}</div>
+    ${F.due === 'custom' ? `<div class="row abm-range"><input type="date" id="df" value="${esc(F.from)}" aria-label="Due from"><span>to</span><input type="date" id="dt" value="${esc(F.to)}" aria-label="Due to"></div>` : ''}
+    <div class="stats abm-stats">${tile('clipboard', 'brand', 'Tasks', rows.length, filtered ? `of ${list.length} you assigned` : 'you assigned')}${tile('clock', 'grey', 'Open', open, `${n('in_progress')} in progress`)}
+      ${tile('bell', 'bad', 'Overdue', n('overdue'), 'past the due date')}${tile('check', 'ok', 'Completed', n('completed'), `${pct}% done${n('paused') ? ` · ${n('paused')} paused` : ''}`)}</div>` : ''}
+    ${rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable tasktable"><thead><tr><th>Title</th><th>Assigned to</th><th>Due date</th><th>Priority</th><th>Status</th><th>Created</th><th>Completed</th><th></th></tr></thead><tbody>
+      ${pg.rows.map((r) => `<tr class="${r.status === 'completed' ? 'tdone' : r.status === 'paused' ? 'tpaused' : ''}"><td class="first" data-label="Title"><span class="ttitle">${esc(r.title)}</span></td>
+        <td data-label="Assigned to"><div class="tperson">${peopleChips(r.assignees)}</div></td><td data-label="Due date" class="nowrap">${due(r)}</td>
+        <td data-label="Priority">${pill('priority', r.priority, TASK_PRI)}</td><td data-label="Status">${pill('status', r.status, TASK_ST)}</td>
+        <td data-label="Created" class="nowrap">${r.created_at ? dmy(r.created_at.slice(0, 10)) : '—'}</td><td data-label="Completed" class="nowrap">${r.completed_at ? dmy(r.completed_at.slice(0, 10)) : '<span class="muted">—</span>'}</td>
+        <td class="acts nowrap"><button class="ibtn tact" data-e="${r.id}" title="Edit" aria-label="Edit task">${ic('edit', 16)}</button></td></tr>`).join('')}</tbody></table></div>${pg.html}`
+      : `<div class="empty card">${ic('send', 28)}<p>${list.length ? 'No tasks match these filters.' : "You haven't assigned any tasks yet."}</p></div>`}`;
+  const reload = () => viewAssignedByMe(el);
+  el.classList.add('still');
+  if ($('#tq', el)) {
+    let tm; $('#tq', el).oninput = (e) => { clearTimeout(tm); tm = setTimeout(async () => { F.q = e.target.value; await reload(); const i = $('#tq', el); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
+    $$('[data-f]', el).forEach((b) => (b.onclick = () => {
+      if (b.getAttribute('aria-expanded') === 'true') return $$('.pmenu').forEach((m) => m.remove()), b.setAttribute('aria-expanded', 'false');
+      const k = b.dataset.f, all = { status: 'All statuses', priority: 'All priorities', who: 'Everyone', due: 'Any due date' }[k];
+      const opts = [{ v: '', html: `<span class="pm-l pm-c pm-all"><span class="tdot"></span></span><span>${all}</span>` },
+        ...FOPTS[k].map((o) => ({ v: o.v, html: `${k === 'who' ? (o.v === '0' ? '<span class="av xs none">?</span>' : avatar(o.l, 'xs')) : k === 'due' ? '' : `<span class="pm-l ${k}-${o.v} pm-c"><span class="tdot"></span></span>`}<span>${esc(o.l)}</span>` }))];
+      pickMenu(b, opts, F[k], (v) => { F[k] = v; reload(); });
+    }));
+    if ($('#tclr', el)) $('#tclr', el).onclick = () => { Object.assign(F, { q: '', status: '', priority: '', who: '', due: '', from: '', to: '' }); reload(); };
+    ['#df', '#dt'].forEach((s) => { if ($(s, el)) $(s, el).onchange = () => { F.from = $('#df', el).value; F.to = $('#dt', el).value; reload(); }; });
+  }
+  pg.bind(el, reload);
+  if ($('#add', el)) $('#add', el).onclick = () => crudForm(CFG.tasks, null, reload);
+  $$('[data-e]', el).forEach((b) => (b.onclick = () => crudForm(CFG.tasks, rows.find((r) => r.id === +b.dataset.e), reload)));
+  if ($('#abx', el)) $('#abx', el).onclick = () => {
+    const cell = (v) => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const lab = (opts, v) => opts.find((o) => o.v === v)?.l || v;
+    const lines = [['Title', 'Description', 'Assigned to', 'Due date', 'Priority', 'Status', 'Created', 'Completed'],
+      ...rows.map((r) => [r.title, r.description, r.assignees.map((a) => a.name).join('; '), r.due_date ? dmy(r.due_date) : '', lab(TASK_PRI, r.priority), lab(TASK_ST, r.status),
+        r.created_at ? dmy(r.created_at.slice(0, 10)) : '', r.completed_at ? dmy(r.completed_at.slice(0, 10)) : ''])];
+    downloadBlob(new Blob(['﻿' + lines.map((l) => l.map(cell).join(',')).join('\r\n')], { type: 'text/csv' }), `tasks_assigned_by_me_${t0}.csv`);
+  };
+}
+
 /* ------------------------------------------------------------ task dashboard */
 // Built from the same scoped list as the Tasks page: admins see the whole organisation, others their own tasks.
 const TASK_COL = { assigned: '#94a3b8', in_progress: '#3b82f6', overdue: '#ef4444', completed: '#22c55e', paused: '#eab308' };
@@ -1627,7 +1717,7 @@ async function viewTaskDashboard(el) {
   const recent = list.filter((r) => r.status === 'completed' && r.completed_at).sort((a, b) => b.completed_at.localeCompare(a.completed_at)).slice(0, 4);
 
   el.innerHTML = `<div class="pagehead dash-head"><div><div class="eyebrow">${greet}, ${esc((S.user.name || '').split(' ')[0])}</div><h1 class="keep">${team ? 'Team tasks at a glance' : 'Your tasks at a glance'}</h1></div>
-      <div class="row"><a class="btn" href="#/tasks">${ic('check')} All tasks</a>${can('tasks.create') ? `<button class="btn primary" id="tadd">${ic('plus')} Add task</button>` : ''}</div></div>
+      <div class="row"><a class="btn" href="#/tasks">${ic('check')} All tasks</a><a class="btn" href="#/tasks/assigned">${ic('send')} Assigned by me</a>${can('tasks.create') ? `<button class="btn primary task-add" id="tadd">${ic('plus')} Add task</button>` : ''}</div></div>
     ${S.user.isAdmin ? '<div id="adm"></div>' : ''}
     ${!list.length ? `<div class="empty card">${ic('check', 28)}<p>No tasks yet. Add one to see your dashboard come alive.</p></div>` : `
     <div class="dg">

@@ -203,3 +203,15 @@ table td, .tbl td { border-color: var(--line); }
   .notif-pop a.notif > div { flex: 1; }
   .notif-pop a.notif b { overflow-wrap: anywhere; }
 }
+
+/* "Assigned by me" report */
+.abm-stats { grid-template-columns: repeat(4, 1fr); margin: 0 0 16px; }
+.abm-range { gap: 8px; margin: -4px 0 14px; } .abm-range input { width: auto; }
+@media (max-width: 900px) { .abm-stats { grid-template-columns: 1fr 1fr; } }
+
+/* phone header: "+" adds a task */
+.top-addtask { display: none; }
+@media (max-width: 760px) {
+  .top .top-addtask { display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, var(--brand), #6a5cff); border-color: transparent; box-shadow: 0 6px 14px -6px var(--brand); }
+}
+@media (max-width: 760px) { .pagehead .task-add { display: none; } } /* the header "+" does this on phones */
