@@ -194,3 +194,12 @@ table td, .tbl td { border-color: var(--line); }
 .tk-wk { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 6px; }
 .tk-wk span { width: 100%; max-width: 28px; min-height: 3px; border-radius: 6px 6px 2px 2px; background: linear-gradient(180deg, #34d399, #22c55e); }
 .tk-wk small { font-size: 10.5px; color: var(--muted); }
+
+/* notifications popup on phones: full width under the header instead of hanging off the bell */
+@media (max-width: 760px) {
+  #bm { position: static; } /* so the popup lines up with the header, not the bell */
+  .notif-pop { position: absolute; left: 0; right: 0; top: calc(100% + 8px); width: auto; max-width: none; transform-origin: top center; background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .notif-pop .notif-list { max-height: calc(100dvh - 260px); }
+  .notif-pop a.notif > div { flex: 1; }
+  .notif-pop a.notif b { overflow-wrap: anywhere; }
+}
