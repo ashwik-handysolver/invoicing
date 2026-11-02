@@ -160,3 +160,37 @@ table td, .tbl td { border-color: var(--line); }
   :root { --glass: rgba(255, 255, 255, .96); --glass-strong: #fff; }
   :root[data-theme="dark"] { --glass: #161c30; --glass-strong: #1a2036; }
 }
+
+/* account menu: notifications switch state */
+[data-push-btn] .um-state { margin-left: auto; font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 999px; color: var(--muted); background: var(--surface-2); }
+[data-push-btn] .um-state.on { color: var(--ok); background: var(--ok-soft); }
+.btn.ob-notify { width: 100%; margin-bottom: 12px; gap: 8px; }
+
+/* picker + its add button: the picker takes the room, the button stays compact */
+.inline-add { display: flex; gap: 8px; align-items: stretch; } .inline-add > select, .inline-add > input { flex: 1 1 auto; min-width: 0; width: auto; } .inline-add > .btn { flex: none; white-space: nowrap; }
+/* invoice form: two-up field rows stack when the card is too narrow (keeps the client picker readable) */
+.formgrid .grid.g2 { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+
+/* ---------- task dashboard ---------- */
+.stat.tk-tile { width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; transition: transform .12s, box-shadow .12s; }
+.stat.tk-tile:hover { transform: translateY(-1px); }
+.tk-stack { display: flex; height: 16px; border-radius: 999px; overflow: hidden; gap: 2px; margin: 16px 0 14px; background: var(--surface-2); }
+.tk-stack span { min-width: 6px; }
+.tk-legend { display: flex; flex-wrap: wrap; gap: 8px; }
+.tk-leg { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 999px; border: 1px solid var(--line); background: var(--glass-strong, var(--surface)); color: var(--text); font: 500 13px/1 inherit; cursor: pointer; }
+.tk-leg:hover { border-color: var(--brand); }
+.tk-leg i { width: 9px; height: 9px; border-radius: 50%; } .tk-leg b { font-weight: 700; }
+.tk-bars { display: grid; gap: 14px; margin-top: 14px; }
+.tk-bar { display: flex; align-items: center; gap: 10px; }
+.tk-bl { width: 64px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.tk-track { flex: 1; height: 10px; border-radius: 999px; background: var(--surface-2); overflow: hidden; min-width: 40px; }
+.tk-track i { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .5s ease; }
+.tk-bar b { min-width: 22px; text-align: right; }
+.tk-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); flex: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 20%, transparent); }
+.tk-row .end, .tk-done .end { display: flex; align-items: center; }
+.tk-load { width: 100%; } .tk-load td { vertical-align: middle; } .tk-load .tk-bar { min-width: 140px; }
+.tk-bad { color: var(--bad); font-weight: 700; }
+.tk-week { display: flex; align-items: flex-end; gap: 8px; height: 130px; margin-top: 14px; }
+.tk-wk { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 6px; }
+.tk-wk span { width: 100%; max-width: 28px; min-height: 3px; border-radius: 6px 6px 2px 2px; background: linear-gradient(180deg, #34d399, #22c55e); }
+.tk-wk small { font-size: 10.5px; color: var(--muted); }

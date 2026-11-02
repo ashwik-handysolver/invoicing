@@ -122,7 +122,43 @@ function paginate(key, rows) {
 const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message, true); } };
 
 /* ------------------------------------------------------------ auth + shell */
+/* ------------------------------------------------------------ push notifications */
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+const pushSub = async () => { if (!pushSupported()) return null; const reg = await navigator.serviceWorker.ready; return reg.pushManager.getSubscription(); };
+const b64ToBytes = (s) => { const b = atob((s + '='.repeat((4 - (s.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
+async function pushOn() { return pushSupported() && Notification.permission === 'granted' && !!(await pushSub()); }
+async function enablePush() {
+  if (!pushSupported()) throw new Error(isIOS() ? 'On iPhone: tap Share, then "Add to Home Screen", open the app from there and turn notifications on.' : "This browser doesn't support notifications.");
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error(perm === 'denied' ? 'Notifications are blocked for this site. Allow them in the browser\'s site settings, then try again.' : 'Notifications were not allowed.');
+  const { publicKey } = await api('/push/key');
+  const reg = await navigator.serviceWorker.ready;
+  const sub = (await reg.pushManager.getSubscription()) || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(publicKey) }));
+  await api('/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } });
+  await api('/push/test', { method: 'POST' }).catch(() => {});
+}
+async function disablePush() {
+  const sub = await pushSub();
+  if (sub) { await api('/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {}); await sub.unsubscribe(); }
+}
+// after sign-in: this device notifies whoever is signed in now
+async function pushSync() { try { if (await pushOn()) { const sub = await pushSub(); await api('/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON() } }); } } catch {} }
+async function paintPushBtn() { const on = await pushOn().catch(() => false); $$('[data-push-btn]').forEach((b) => { b.setAttribute('aria-checked', on); const s = $('.um-state', b); if (s) { s.textContent = on ? 'On' : 'Off'; s.classList.toggle('on', on); } }); }
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-push-btn]');
+  if (!b) return;
+  e.stopPropagation();
+  b.disabled = true;
+  try {
+    if (await pushOn()) { await disablePush(); toast('Notifications turned off on this device'); }
+    else { await enablePush(); toast('Notifications are on: a test one is on its way'); }
+  } catch (x) { toast(x.message, true); }
+  finally { b.disabled = false; paintPushBtn(); }
+});
+
 function signOut() {
+  pushSub().then((sub) => { if (sub) { const t = S.token; fetch('/api/push/unsubscribe', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {}); sub.unsubscribe(); } }).catch(() => {});
   localStorage.removeItem('token'); S.token = null; S.user = null; S.meta = null;
   clearTimeout(pollTimer); sessionSet('onb', null);
   renderLogin();
@@ -183,7 +219,7 @@ function renderLogin() {
 }
 
 const NAV = [
-  { id: 'dashboard', label: 'Revenue', icon: 'chart', perm: 'dashboard.view', hash: '#/dashboard', grp: 'Sales' },
+  { id: 'dashboard', label: 'Dashboard', icon: 'chart', perm: 'dashboard.view', hash: '#/dashboard', grp: 'Sales' },
   { id: 'invoices', label: 'Invoices', icon: 'file', perm: 'invoices.view', hash: '#/invoices', grp: 'Sales' },
   { id: 'payments', label: 'Payments', icon: 'rupee', perm: 'invoices.view', hash: '#/payments', grp: 'Sales' },
   { id: 'recurring', label: 'Recurring', icon: 'repeat', perm: 'recurring.view', hash: '#/recurring', grp: 'Sales' },
@@ -196,6 +232,7 @@ const NAV = [
   { id: 'templates', label: 'Templates', icon: 'chat', perm: 'templates.view', hash: '#/templates', grp: 'Setup', inSettings: true },
   { id: 'users', label: 'Users', icon: 'user', perm: 'users.view', hash: '#/users', grp: 'Admin', inSettings: true },
   { id: 'settings', label: 'Settings', icon: 'gear', perm: 'settings.view', anyPerm: ['settings.view', 'users.view', 'templates.view', 'activity.view'], hash: '#/settings', grp: 'Admin', inSettings: true },
+  { id: 'taskdash', label: 'Dashboard', icon: 'chart', perm: 'tasks.view', hash: '#/tasks/dashboard', grp: 'Tasks', sec: 'tasks' },
   { id: 'tasks', label: 'Tasks', icon: 'check', perm: 'tasks.view', hash: '#/tasks', grp: 'Tasks', sec: 'tasks' },
   { id: 'management', label: 'Dashboard', icon: 'grid', perm: 'management.view', hash: '#/management', grp: 'Management', sec: 'top' },
   { id: 'organisations', label: 'Organisations', icon: 'users', perm: 'management.view', hash: '#/organisations', grp: 'Management', sec: 'top' },
@@ -233,22 +270,22 @@ function renderShell() {
       ${referButton()}</aside>
     <div class="main"><header class="top"><div class="title" id="pt"></div>
       ${S.user.membership?.status === 'approved' ? `<button class="searchpill" id="gs" aria-label="Search">${ic('search', 17)}<span>Search invoices, clients…</span><kbd>Ctrl K</kbd></button>` : '<span class="grow"></span>'}
-      ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new?type=tax">${ic('plus')} Invoice</a>` : ''}
+      ${can('invoices.create') ? `<a class="btn primary sm top-create" href="#/invoices/new">${ic('plus')} Invoice</a>` : ''}
       ${Object.values(bellSources()).some(Boolean) ? `<div class="usermenu" id="bm"><button type="button" class="ibtn bellbtn" aria-haspopup="menu" aria-expanded="false" aria-label="Notifications" title="Notifications">${ic('bell', 18)}<span class="badge hidden" data-badge></span></button>
         <div class="um-pop notif-pop" role="menu"><div class="um-who"><b>Notifications</b></div><div class="notif-list"></div>${can('reminders.view') ? '<a class="notif-all" href="#/reminders">View all reminders</a>' : ''}</div></div>` : ''}
       <button class="ibtn" data-theme-btn aria-label="Toggle light / dark theme">${themeIcon()}</button>
       <div class="usermenu" id="um"><button type="button" class="um-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Account">${avatar(S.user.name, 'sm')}</button>
         <div class="um-pop" role="menu"><div class="um-who"><b>${esc(S.user.name)}</b><small class="muted">${esc(S.user.role)}${S.user.membership?.organisation ? ` · ${esc(S.user.membership.organisation)}` : ''}</small></div>
-          <button type="button" role="menuitem" id="acct">${ic('user', 17)} My account</button>${settingsOk ? `<a role="menuitem" href="#/settings">${ic('gear', 17)} Settings</a>` : ''}<button type="button" role="menuitem" class="um-logout" id="so">${ic('logout', 17)} Log out</button></div></div></header>
+          <button type="button" role="menuitem" id="acct">${ic('user', 17)} My account</button><button type="button" role="menuitemcheckbox" aria-checked="false" data-push-btn>${ic('bell', 17)} Notifications<span class="um-state">Off</span></button>${settingsOk ? `<a role="menuitem" href="#/settings">${ic('gear', 17)} Settings</a>` : ''}<button type="button" role="menuitem" class="um-logout" id="so">${ic('logout', 17)} Log out</button></div></div></header>
       <main class="content" id="view"></main></div>
     <nav class="bottom">${bottom.slice(0, 2).map((n) => link(n, '')).join('')}${S.user.membership?.status === 'approved' ? `<button type="button" class="tab-mic" data-mic aria-label="Voice"><span>${ic('mic', 26, 2.6)}</span></button>` : ''}${bottom.slice(2).map((n) => link(n, '')).join('')}<a href="#" id="more"><span class="ico">${ic('grid')}</span><span class="lb">More</span></a></nav>
-    ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new?type=tax" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
+    ${can('invoices.create') ? `<a class="fab hidden" id="fab" href="#/invoices/new" aria-label="New invoice">${ic('plus', 24)}</a>` : ''}</div>`;
   $('#acct').onclick = () => { umSet(false); openAccount(); };
   $('#so').onclick = (e) => { e.preventDefault(); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
   $('#more').onclick = (e) => { e.preventDefault(); openMore(items); };
   if ($('#gs')) $('#gs').onclick = openSearch;
   const um = $('#um'), umb = $('.um-btn', um), umSet = (o) => { um.classList.toggle('open', o); umb.setAttribute('aria-expanded', o); };
-  umb.onclick = (e) => { e.stopPropagation(); umSet(!um.classList.contains('open')); };
+  umb.onclick = (e) => { e.stopPropagation(); umSet(!um.classList.contains('open')); paintPushBtn(); };
   $('.um-pop', um).onclick = (e) => { if (e.target.closest('a')) umSet(false); };
   document.addEventListener('click', (e) => { if (!um.contains(e.target)) umSet(false); });
   const bm = $('#bm');
@@ -272,7 +309,7 @@ async function bellData() {
   const src = bellSources(), t0 = todayStr();
   const [pay, tasks, platform] = await Promise.all([
     src.pay ? api('/reminders/queue').catch(() => []) : [],
-    src.tasks ? api('/tasks').then((l) => l.filter((t) => t.assignees.some((a) => a.id === S.user.id) && t.status !== 'done' && t.due_date && t.due_date <= t0)).catch(() => []) : [],
+    src.tasks ? api('/tasks').then((l) => l.filter((t) => t.assignees.some((a) => a.id === S.user.id) && taskOpen(t) && t.due_date && t.due_date <= t0)).catch(() => []) : [],
     src.platform ? api('/management/notifications').catch(() => []) : [],
   ]);
   return { pay, tasks, platform, t0 };
@@ -355,6 +392,7 @@ async function boot() {
   if (!S.token) return renderLogin();
   try {
     S.user = (await api('/me')).user;
+    pushSync();
     const member = S.user.membership?.status === 'approved';
     if (!member && !S.user.isManagement) return renderMembership();
     S.meta = member ? await api('/meta') : { states: {}, organisations: [], permissions: {} }; // management-only login
@@ -366,7 +404,7 @@ async function boot() {
   }
   if (sessionGet('onb')) return resumeSetup();
   renderShell();
-  if (!location.hash || location.hash === '#/') location.hash = S.user.isManagement ? '#/management' : can('dashboard.view') ? '#/dashboard' : can('invoices.view') ? '#/invoices' : can('tasks.view') ? '#/tasks' : '#/settings';
+  if (!location.hash || location.hash === '#/') location.hash = S.user.isManagement ? '#/management' : can('dashboard.view') ? '#/dashboard' : can('invoices.view') ? '#/invoices' : can('tasks.view') ? '#/tasks/dashboard' : '#/settings';
   route();
 }
 
@@ -412,6 +450,7 @@ const routes = [
   [/^#\/settings$/, 'settings', null, (el) => viewSettings(el)],
   [/^#\/organisations$/, 'organisations', 'management.view', viewOrgControl],
   [/^#\/tasks$/, 'tasks', 'tasks.view', viewTasks],
+  [/^#\/tasks\/dashboard$/, 'taskdash', 'tasks.view', viewTaskDashboard],
   [/^#\/management$/, 'management', 'management.view', viewManagement],
 ];
 async function route() {
@@ -581,7 +620,7 @@ async function viewDashboard(el) {
         ${tile('check', 'ok', 'Collected', money0(d.collected), `${pct}% of billed`)}
         ${tile('clock', 'bad', 'Overdue', money0(d.overdue.s), `${d.overdue.n} past due date`)}
         ${tile('wallet', d.net >= 0 ? 'brand' : 'bad', 'Net after expenses', money0(d.net), `expenses ${money0(d.expenses.total)}`)}</div>
-      <div class="qa c12">${can('invoices.create') ? `<a class="qa-i" href="#/invoices/new?type=tax"><span>${ic('plus', 18)}</span>New invoice</a>` : ''}${can('payments.create') ? `<button class="qa-i" id="qp2"><span>${ic('rupee', 18)}</span>Record payment</button>` : ''}
+      <div class="qa c12">${can('invoices.create') ? `<a class="qa-i" href="#/invoices/new"><span>${ic('plus', 18)}</span>New invoice</a>` : ''}${can('payments.create') ? `<button class="qa-i" id="qp2"><span>${ic('rupee', 18)}</span>Record payment</button>` : ''}
         ${can('clients.create') ? `<button class="qa-i" id="qc"><span>${ic('users', 18)}</span>Add client</button>` : ''}${can('expenses.create') ? `<button class="qa-i" id="qe"><span>${ic('wallet', 18)}</span>Add expense</button>` : ''}
         ${can('reminders.view') ? `<a class="qa-i" href="#/reminders"><span>${ic('bell', 18)}</span>Reminders</a>` : ''}<a class="qa-i" href="#/payments"><span>${ic('chart', 18)}</span>All payments</a></div>
       <section class="card c8"><div class="row sp"><h2>Billed vs collected</h2><div class="legend"><span><i style="background:var(--c1)"></i>Billed</span><span><i style="background:var(--c2)"></i>Collected</span></div></div>${chart(d.monthly)}</section>
@@ -770,7 +809,7 @@ async function viewInvoices(el, m, q) {
   const tabs = [['', 'All'], ['unpaid', 'Unpaid'], ['partial', 'Partial'], ['overdue', 'Overdue'], ['paid', 'Paid'], ['proforma', 'Proforma']];
   el.innerHTML = `<div class="pagehead"><div><h1>Invoices</h1><div class="muted small">${q.client_id && all_[0] ? esc(all_[0].client_name) + ' · ' : ''}${all_.length} total</div></div><div class="row">
       ${can('invoices.export') ? `<button class="btn" id="ex">${ic('download')} Export</button>` : ''}
-      ${can('invoices.create') ? `<a class="btn" href="#/invoices/new?type=proforma">Proforma</a><a class="btn primary" href="#/invoices/new?type=tax">${ic('plus')} New invoice</a>` : ''}</div></div>
+      ${can('invoices.create') ? `<a class="btn" href="#/invoices/new?type=tax">Tax invoice</a><a class="btn primary" href="#/invoices/new">${ic('plus')} New invoice</a>` : ''}</div></div>
     <div class="sumstrip"><div class="ss"><span>Billed</span><b>${money0(sum.billed)}</b></div><div class="ss ok"><span>Received</span><b>${money0(sum.paid)}</b></div><div class="ss bad"><span>Pending</span><b>${money0(sum.pend)}</b></div>
       <div class="ss prog-ss"><span>${sum.billed > 0 ? Math.round((sum.paid / sum.billed) * 100) : 0}% collected</span><div class="prog"><span style="width:${sum.billed > 0 ? Math.min(100, (sum.paid / sum.billed) * 100) : 0}%"></span></div></div></div>
     <div class="filterbar"><div class="tabs">${tabs.map(([v, l]) => `<button class="tab ${invFilter.status === v ? 'on' : ''}" data-s="${v}">${l}<i>${cnt[v] || 0}</i></button>`).join('')}</div>
@@ -821,7 +860,7 @@ async function viewInvoiceForm(el, id, q = {}) {
   const orgs = S.meta.organisations;
   if (!orgs.length) { el.innerHTML = '<div class="empty card">Add an organisation in Settings first.</div>'; return; }
   const st = {
-    type: inv ? inv.invoice_type : q.type === 'proforma' ? 'proforma' : 'tax',
+    type: inv ? inv.invoice_type : q.type === 'tax' ? 'tax' : 'proforma',
     clientId: inv?.client_id || (q.client_id ? +q.client_id : null),
     gst: inv ? !!inv.gst_applied : true,
     pay: inv ? { qr: !!inv.pay_qr, upi: !!inv.pay_upi, bank: !!inv.pay_bank } : { qr: true, upi: true, bank: true },
@@ -829,11 +868,11 @@ async function viewInvoiceForm(el, id, q = {}) {
   };
   const due = inv?.due_date || ymd(new Date(Date.now() + 7 * 864e5));
   const canClient = can('clients.create'), canProduct = can('products.create');
-  const clientOpts = () => `<option value="">Select client…</option>${clients.map((c) => `<option value="${c.id}" ${st.clientId === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}${canClient ? '<option value="__new">＋ Add new client…</option>' : ''}`;
+  const clientOpts = () => `<option value="">Select client…</option>${clients.map((c) => `<option value="${c.id}" ${st.clientId === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}`;
   const productOpts = (sel) => `<option value="">Custom item</option>${products.map((p) => `<option value="${p.id}" ${sel === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}${canProduct ? '<option value="__new">＋ Add new service…</option>' : ''}`;
 
   el.innerHTML = `<div class="pagehead"><div><a href="${inv ? '#/invoices/' + id : '#/invoices'}" class="small">← Back</a><h1>${inv ? 'Edit ' + esc(inv.invoice_number) : 'New invoice'}</h1></div>
-    ${inv ? '' : `<div class="seg" role="tablist"><button type="button" data-ty="tax">Tax invoice</button><button type="button" data-ty="proforma">Proforma</button></div>`}</div>
+    ${inv ? '' : `<div class="seg" role="tablist"><button type="button" data-ty="proforma">Proforma</button><button type="button" data-ty="tax">Tax invoice</button></div>`}</div>
     <form id="f"><div class="formgrid"><div class="stack">
       <div class="card"><div class="step-h"><span class="hd-icon">${ic('user', 15)}</span><h2>Bill to</h2></div>
         <div class="grid g2"><div class="field"><label>Client</label><div class="inline-add"><select id="cl" required>${clientOpts()}</select>${canClient ? '<button type="button" class="btn" id="nc" title="Add new client">＋ New</button>' : ''}</div></div>
@@ -871,7 +910,7 @@ async function viewInvoiceForm(el, id, q = {}) {
 
   // pick a client / product created inline
   const addClient = () => crudForm(CFG.clients, null, (row) => { clients.push(row); st.clientId = row.id; $('#cl').innerHTML = clientOpts(); refresh(); });
-  $('#cl').onchange = (e) => { if (e.target.value === '__new') { $('#cl').value = st.clientId || ''; addClient(); } else { st.clientId = +e.target.value || null; refresh(); } };
+  $('#cl').onchange = (e) => { st.clientId = +e.target.value || null; refresh(); };
   if ($('#nc')) $('#nc').onclick = addClient;
 
   const drawItems = () => {
@@ -1364,7 +1403,8 @@ async function crudForm(cfg, row, done, onCancel) {
 
 /* ------------------------------------------------------------ tasks */
 const TASK_PRI = [{ v: 'high', l: 'High' }, { v: 'medium', l: 'Medium' }, { v: 'low', l: 'Low' }];
-const TASK_ST = [{ v: 'todo', l: 'To do' }, { v: 'in_progress', l: 'In progress' }, { v: 'done', l: 'Done' }];
+const TASK_ST = [{ v: 'assigned', l: 'Assigned' }, { v: 'in_progress', l: 'In progress' }, { v: 'overdue', l: 'Overdue' }, { v: 'completed', l: 'Completed' }, { v: 'paused', l: 'Paused' }];
+const taskOpen = (t) => ['assigned', 'in_progress', 'overdue'].includes(t.status); // completed / paused tasks are not chased
 CFG.tasks = {
   title: 'Tasks', api: '/tasks', perm: 'tasks', noun: 'task',
   fields: [
@@ -1372,7 +1412,7 @@ CFG.tasks = {
     { k: 'due_date', l: 'Due date', t: 'date' }, { k: 'assignees', l: 'Assigned to', t: 'multi', val: (r) => (r.assignees || []).map((a) => a.id) },
     { k: 'priority', l: 'Priority', t: 'select', opts: TASK_PRI }, { k: 'status', l: 'Status', t: 'select', opts: TASK_ST },
   ],
-  defaults: { priority: 'medium', status: 'todo' },
+  defaults: { priority: 'medium', status: 'assigned' },
   onOpen(form) {
     const dot = (k) => (o) => (o.value ? `<span class="pm-l ${k}-${o.value} pm-c"><span class="tdot"></span></span><span>${esc(o.text)}</span>` : `<span>${esc(o.text)}</span>`);
     const person = (o) => +o.value === S.user.id ? `<span class="pm-l">${youChip(`${esc(o.text)} <small class="muted">(you)</small>`)}</span>` : `<span class="pm-l">${o.value ? avatar(o.text, 'xs') : '<span class="av xs none">?</span>'}<span class="${o.value ? '' : 'muted'}">${esc(o.text)}${+o.value === S.user.id ? ' <small class="muted">(you)</small>' : ''}</span></span>`;
@@ -1450,11 +1490,11 @@ function pickMenu(anchor, opts, cur, onPick, { multi = false } = {}) {
 }
 // Tasks page filters: a view tab plus search / status / priority (kept while you move around the app)
 const TASK_F = { tab: 'all', q: '', status: '', priority: '' };
-const TASK_TABS = [{ v: 'all', l: 'All tasks' }, { v: 'mine', l: 'Assigned to me' }, { v: 'byme', l: 'Assigned by me' }, { v: 'overdue', l: 'Overdue' }, { v: 'done', l: 'Completed' }];
+const TASK_TABS = [{ v: 'all', l: 'All tasks' }, { v: 'mine', l: 'Assigned to me' }, { v: 'byme', l: 'Assigned by me' }, { v: 'overdue', l: 'Overdue' }, { v: 'completed', l: 'Completed' }];
 async function viewTasks(el) {
   const all_ = await api('/tasks'), me = S.user.id, F = TASK_F, t0 = todayStr();
   const mine = (r) => r.assignees.some((a) => a.id === me);
-  const inTab = (r, tab) => ({ all: true, mine: mine(r), byme: r.assigned_by === me, overdue: r.status !== 'done' && r.due_date && r.due_date < t0, done: r.status === 'done' }[tab]);
+  const inTab = (r, tab) => ({ all: true, mine: mine(r), byme: r.assigned_by === me, overdue: r.status === 'overdue', completed: r.status === 'completed' }[tab]);
   const q = F.q.trim().toLowerCase();
   const rows = all_.filter((r) => inTab(r, F.tab) && (!F.status || r.status === F.status) && (!F.priority || r.priority === F.priority)
     && (!q || [r.title, r.description, r.assigned_by_name, ...r.assignees.map((a) => a.name)].some((v) => (v || '').toLowerCase().includes(q))));
@@ -1474,7 +1514,7 @@ async function viewTasks(el) {
   };
   const due = (r) => {
     if (!r.due_date) return '<span class="muted">—</span>';
-    const days = Math.round((new Date(r.due_date) - new Date(todayStr())) / 864e5), open = r.status !== 'done';
+    const days = Math.round((new Date(r.due_date) - new Date(todayStr())) / 864e5), open = taskOpen(r);
     const note = !open ? '' : days < 0 ? `<small class="tlate">${-days}d overdue</small>` : days === 0 ? '<small class="tsoon">Due today</small>' : days <= 3 ? `<small class="tsoon">In ${days}d</small>` : '';
     return `<div class="tdue">${dmy(r.due_date)}${note}</div>`;
   };
@@ -1491,7 +1531,7 @@ async function viewTasks(el) {
       ${fbtn('status', 'Status', TASK_ST)}${fbtn('priority', 'Priority', TASK_PRI)}
       ${F.q || F.status || F.priority ? '<button type="button" class="btn sm" id="tclr">Clear</button>' : ''}</div>` : ''}
     ${rows.length ? `<div class="card tablewrap" style="padding:0"><table class="stackable tasktable"><thead><tr><th>Title</th><th>Description</th><th>Due date</th><th>Priority</th><th>Status</th><th>Assigned to</th><th>Assigned by</th><th></th></tr></thead><tbody>
-      ${pg.rows.map((r) => `<tr class="${r.status === 'done' ? 'tdone' : ''}"><td class="first" data-label="Title"><span class="ttitle">${esc(r.title)}</span></td>
+      ${pg.rows.map((r) => `<tr class="${r.status === 'completed' ? 'tdone' : r.status === 'paused' ? 'tpaused' : ''}"><td class="first" data-label="Title"><span class="ttitle">${esc(r.title)}</span></td>
         <td data-label="Description" class="tdesc">${r.description ? `<span title="${esc(r.description)}">${esc(r.description)}</span>` : '<span class="muted">—</span>'}</td>
         <td data-label="Due date" class="nowrap">${due(r)}</td>
         <td data-label="Priority">${pill(r, 'priority', TASK_PRI, manage(r))}</td><td data-label="Status">${pill(r, 'status', TASK_ST, canStatus(r))}</td>
@@ -1535,6 +1575,80 @@ async function viewTasks(el) {
     } else opts = (k === 'status' ? TASK_ST : TASK_PRI).map((o) => ({ v: o.v, html: `<span class="pm-l ${k}-${o.v} pm-c"><span class="tdot"></span></span><span>${o.l}</span>` }));
     pickMenu(b, opts, r[k] ?? '', (v) => save(r.id, k, v));
   })));
+}
+
+/* ------------------------------------------------------------ task dashboard */
+// Built from the same scoped list as the Tasks page: admins see the whole organisation, others their own tasks.
+const TASK_COL = { assigned: '#94a3b8', in_progress: '#3b82f6', overdue: '#ef4444', completed: '#22c55e', paused: '#eab308' };
+async function viewTaskDashboard(el) {
+  const list = await api('/tasks'), t0 = todayStr(), team = S.user.isAdmin;
+  const dayOff = (n) => ymd(new Date(Date.now() + n * 864e5));
+  const in7 = dayOff(7), ago7 = dayOff(-7), ago30 = dayOff(-30);
+  const doneOn = (r) => (r.completed_at || '').slice(0, 10);
+  const open = list.filter(taskOpen), overdue = list.filter((r) => r.status === 'overdue');
+  const dueToday = open.filter((r) => r.due_date === t0 && r.status !== 'overdue');
+  const dueSoon = open.filter((r) => r.due_date && r.due_date > t0 && r.due_date <= in7).sort((a, b) => a.due_date.localeCompare(b.due_date));
+  const doneWeek = list.filter((r) => r.status === 'completed' && doneOn(r) >= ago7);
+  const count = Object.fromEntries(TASK_ST.map((s) => [s.v, list.filter((r) => r.status === s.v).length]));
+  const active = list.length - count.paused, pct = active ? Math.round((count.completed / active) * 100) : 0;
+  const hr = new Date().getHours(), greet = hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : 'Good evening';
+  const tile = (icn, tone, label, val, sub, st) => `<button type="button" class="stat ${tone} tk-tile" data-go-status="${st}"><span class="stat-ic">${ic(icn, 19)}</span><div class="stat-b"><div class="stat-l">${label}</div><div class="stat-v">${val}</div><div class="stat-s">${sub}</div></div></button>`;
+  const daysLabel = (r) => { const d = Math.round((new Date(r.due_date) - new Date(t0)) / 864e5); return d < 0 ? `${-d}d overdue` : d === 0 ? 'due today' : d === 1 ? 'tomorrow' : `in ${d} days`; };
+  const row = (r) => `<a class="mr-i tk-row" href="#/tasks" data-q="${esc(r.title)}"><span class="tk-dot" style="--c:${TASK_COL[r.status]}"></span><div class="mid"><div class="t">${esc(r.title)}</div>
+    <div class="s">${r.due_date ? `${dmy(r.due_date)} · ${daysLabel(r)}` : 'No due date'}${r.priority === 'high' ? ' · high priority' : ''}</div></div><div class="end">${peopleChips(r.assignees)}</div></a>`;
+  // status mix as one stacked bar
+  const stack = list.length ? TASK_ST.filter((s) => count[s.v]).map((s) => `<span style="flex:${count[s.v]};background:${TASK_COL[s.v]}" title="${s.l}: ${count[s.v]}"></span>`).join('') : '';
+  const legend = TASK_ST.map((s) => `<button type="button" class="tk-leg" data-go-status="${s.v}"><i style="background:${TASK_COL[s.v]}"></i>${s.l}<b>${count[s.v]}</b></button>`).join('');
+  // open work by priority
+  const pri = TASK_PRI.map((p) => ({ ...p, n: open.filter((r) => r.priority === p.v).length }));
+  const priMax = Math.max(1, ...pri.map((p) => p.n));
+  const priCol = { high: '#ef4444', medium: '#f59e0b', low: '#22c55e' };
+  // completed per week, last 8 weeks (weeks start Monday)
+  const monday = (d) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return ymd(x); };
+  const weeks = Array.from({ length: 8 }, (_, i) => monday(dayOff(-7 * (7 - i))));
+  const perWeek = weeks.map((w) => list.filter((r) => r.status === 'completed' && r.completed_at && monday(doneOn(r)) === w).length);
+  const weekMax = Math.max(1, ...perWeek);
+  // workload per person (admins)
+  const people = new Map();
+  for (const r of list) for (const a of r.assignees.length ? r.assignees : [{ id: 0, name: '' }]) {
+    const p = people.get(a.id) || { id: a.id, name: a.name, open: 0, overdue: 0, done: 0 };
+    if (taskOpen(r)) p.open++; if (r.status === 'overdue') p.overdue++; if (r.status === 'completed' && doneOn(r) >= ago30) p.done++;
+    people.set(a.id, p);
+  }
+  const load = [...people.values()].filter((p) => p.open || p.done).sort((a, b) => b.overdue - a.overdue || b.open - a.open).slice(0, 8);
+  const loadMax = Math.max(1, ...load.map((p) => p.open));
+  const recent = list.filter((r) => r.status === 'completed' && r.completed_at).sort((a, b) => b.completed_at.localeCompare(a.completed_at)).slice(0, 4);
+
+  el.innerHTML = `<div class="pagehead dash-head"><div><div class="eyebrow">${greet}, ${esc((S.user.name || '').split(' ')[0])}</div><h1 class="keep">${team ? 'Team tasks at a glance' : 'Your tasks at a glance'}</h1></div>
+      <div class="row"><a class="btn" href="#/tasks">${ic('check')} All tasks</a>${can('tasks.create') ? `<button class="btn primary" id="tadd">${ic('plus')} Add task</button>` : ''}</div></div>
+    ${!list.length ? `<div class="empty card">${ic('check', 28)}<p>No tasks yet. Add one to see your dashboard come alive.</p></div>` : `
+    <div class="dg">
+      <section class="hero c7"><div class="hero-l"><div class="hero-k">Open tasks</div><div class="hero-v">${open.length}</div>
+          <div class="hero-s">${count.in_progress} in progress · ${count.assigned} not started</div>
+          <div class="hero-chips">${overdue.length ? `<span class="hchip bad">${overdue.length} overdue</span>` : '<span class="hchip">Nothing overdue</span>'}${dueToday.length ? `<span class="hchip">${dueToday.length} due today</span>` : ''}${dueSoon.length ? `<span class="hchip">${dueSoon.length} due this week</span>` : ''}</div></div>
+        <div class="hero-r">${ring(pct, 118, 12, '#fff', 'rgba(255,255,255,.22)', '#fff')}<div class="hero-rl">of tasks<br>completed</div></div></section>
+      <div class="c5 stats">${tile('user', 'grey', 'Assigned', count.assigned, 'not started yet', 'assigned')}${tile('clock', 'brand', 'In progress', count.in_progress, 'being worked on', 'in_progress')}
+        ${tile('bell', 'bad', 'Overdue', count.overdue, 'past the due date', 'overdue')}${tile('check', 'ok', 'Completed', doneWeek.length, 'in the last 7 days', 'completed')}</div>
+      <section class="card c7"><div class="row sp"><h2>Status</h2><span class="small muted">${list.length} task${list.length === 1 ? '' : 's'}${count.paused ? ` · ${count.paused} paused` : ''}</span></div>
+        <div class="tk-stack" role="img" aria-label="Tasks by status">${stack}</div><div class="tk-legend">${legend}</div></section>
+      <section class="card c5"><h2>Open tasks by priority</h2><div class="tk-bars">${pri.map((p) => `<div class="tk-bar"><span class="tk-bl">${p.l}</span><span class="tk-track"><i style="width:${(p.n / priMax) * 100}%;background:${priCol[p.v]}"></i></span><b>${p.n}</b></div>`).join('')}</div></section>
+      <section class="card c7"><div class="row sp"><h2>Overdue</h2>${overdue.length ? `<a class="small" href="#/tasks" data-go-tab="overdue">See all →</a>` : ''}</div>
+        ${overdue.length ? `<div class="mrows">${[...overdue].sort((a, b) => (a.due_date || '').localeCompare(b.due_date || '')).slice(0, 6).map(row).join('')}</div>` : '<div class="empty">Nothing overdue. Nice work.</div>'}</section>
+      <section class="card c5"><h2>Due in the next 7 days</h2>${dueToday.length + dueSoon.length ? `<div class="mrows">${[...dueToday, ...dueSoon].slice(0, 6).map(row).join('')}</div>` : '<div class="empty">Nothing due this week.</div>'}</section>
+      ${team && load.length ? `<section class="card c8"><h2>Team workload</h2><div class="tablewrap"><table class="tk-load"><thead><tr><th>Person</th><th>Open</th><th class="num">Overdue</th><th class="num">Done (30 days)</th></tr></thead><tbody>
+        ${load.map((p) => `<tr><td><div class="tperson">${p.id === S.user.id ? youChip() : p.id ? `${avatar(p.name, 'xs')}<span>${esc(p.name)}</span>` : '<span class="av xs none">?</span><span class="muted">Unassigned</span>'}</div></td>
+          <td><div class="tk-bar"><span class="tk-track"><i style="width:${(p.open / loadMax) * 100}%"></i></span><b>${p.open}</b></div></td>
+          <td class="num">${p.overdue ? `<span class="tk-bad">${p.overdue}</span>` : '0'}</td><td class="num">${p.done}</td></tr>`).join('')}</tbody></table></div></section>` : ''}
+      <section class="card ${team && load.length ? 'c4' : 'c12'}"><h2>Completed per week</h2>
+        <div class="tk-week">${perWeek.map((n, i) => `<div class="tk-wk" title="Week of ${dmy(weeks[i])}: ${n} completed"><span style="height:${(n / weekMax) * 100}%"></span><small>${weeks[i].slice(8)}/${weeks[i].slice(5, 7)}</small></div>`).join('')}</div>
+        ${recent.length ? `<div class="small muted" style="margin:12px 0 4px">Recently completed</div><div class="mrows">${recent.map((r) => `<div class="mr-i tk-done"><span class="tk-dot" style="--c:${TASK_COL.completed}"></span><div class="mid"><div class="t">${esc(r.title)}</div><div class="s">${fmtLong(r.completed_at)}</div></div></div>`).join('')}</div>` : ''}</section>
+    </div>`}`;
+  // shortcuts into the Tasks page with the matching filter
+  const goTasks = (patch) => { Object.assign(TASK_F, { tab: 'all', q: '', status: '', priority: '' }, patch); location.hash = '#/tasks'; };
+  $$('[data-go-status]', el).forEach((b) => (b.onclick = () => goTasks(b.dataset.goStatus === 'overdue' ? { tab: 'overdue' } : { status: b.dataset.goStatus })));
+  $$('[data-go-tab]', el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); goTasks({ tab: a.dataset.goTab }); }));
+  $$('.tk-row', el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); goTasks({ q: a.dataset.q }); }));
+  if ($('#tadd', el)) $('#tadd', el).onclick = () => crudForm(CFG.tasks, null, () => viewTaskDashboard(el));
 }
 
 /* ------------------------------------------------------------ settings */
@@ -2146,6 +2260,7 @@ function renderMembership() {
     authShell(`<div class="auth-card ob-wait"><span class="ob-badge wait">${ic('clock', 26)}</span>
         <h1>Request sent</h1><p class="lead">Your request to join <b>${esc(m.organisation)}</b> has been submitted. Waiting for admin approval.</p>
         <div class="ob-live"><i></i>We'll take you in automatically once you're approved. You can also close this page and sign in later.</div>
+        ${pushSupported() ? `<button type="button" class="btn ob-notify" data-push-btn>${ic('bell', 16)} Notify me when approved<span class="um-state">Off</span></button>` : ''}
         <div class="stack"><button class="btn" id="ck">Check now</button><button class="btn" id="cx">Cancel request</button></div>${who}</div>`);
     const check = async (manual) => {
       try {

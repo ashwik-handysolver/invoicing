@@ -390,3 +390,14 @@ table.mgmt td.first, table.mgmt td[data-label="Created by"] { max-width: 200px; 
 .pmenu button.multi .pm-check { visibility: visible; width: 18px; height: 18px; border: 1.5px solid var(--line); border-radius: 5px; justify-content: center; align-items: center; color: transparent; }
 .pmenu button.multi.on .pm-check { background: var(--brand); border-color: var(--brand); color: #fff; }
 .pmenu button.multi .pm-check svg { width: 12px; height: 12px; }
+
+/* task statuses: assigned, in progress, overdue, completed, paused */
+.status-assigned { background: #eef0f4; color: #4b5563; }
+.status-overdue { background: #fee2e2; color: #b91c1c; }
+.status-completed { background: #dcfce7; color: #15803d; }
+.status-paused { background: #fef3c7; color: #a16207; }
+:root[data-theme="dark"] .status-assigned { background: rgba(148,163,184,.2); color: #cbd5e1; }
+:root[data-theme="dark"] .status-overdue { background: rgba(239,68,68,.2); color: #fca5a5; }
+:root[data-theme="dark"] .status-completed { background: rgba(34,197,94,.18); color: #86efac; }
+:root[data-theme="dark"] .status-paused { background: rgba(234,179,8,.18); color: #fde047; }
+.tasktable tr.tpaused .ttitle { color: var(--muted); }

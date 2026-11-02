@@ -3,6 +3,7 @@
 import { all, get, run, tx, normCode, newInviteCode } from './db.js';
 import { createTenant, DEFAULT_MEMBER_ROLE } from './seed.js';
 import { logAct } from './activity.js';
+import { notify, tenantAdmins } from './push.js';
 import { MODULES, ALL_MODULES, tenantModules } from './modules.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -67,6 +68,7 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
     }
     const id = (await run("INSERT INTO memberships (tenant_id, user_id, role, status) VALUES (?, ?, 'member', 'pending')", t.id, user.id)).lastInsertRowid;
     (await logAct(null, 'request', 'membership', id, `${user.email} asked to join`, t.id));
+    await notify(await tenantAdmins(t.id), { title: 'New join request', body: `${user.name || user.email} wants to join ${t.name}`, url: '/#/dashboard', tag: `join-${id}` });
     return 'pending';
   }
 
@@ -164,13 +166,18 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
       (await run("UPDATE memberships SET status = 'approved', role = ?, role_id = ?, decided_at = CURRENT_TIMESTAMP, decided_by = ? WHERE id = ?", isAdmin ? 'admin' : 'member', role.id, req.user.id, m.id));
       if (!(await get('SELECT role_id FROM users WHERE id = ?', m.user_id))?.role_id) (await run('UPDATE users SET role_id = ? WHERE id = ?', role.id, m.user_id)); // legacy fallback only
       (await logAct(req.user, 'approve', 'membership', m.id, `${m.email} joined as ${role.name}`));
+      req.approved = m;
     }));
+    const t = await get('SELECT name FROM tenants WHERE id = ?', req.user.tid);
+    await notify([req.approved.user_id], { title: "You're in!", body: `${t.name} approved your request. Open the app to get started.`, url: '/', tag: 'membership' });
     return { ok: true };
   }));
   base.post('/members/requests/:id/reject', admin, wrap(async (req) => {
     const m = (await pendingRequest(req));
     (await run("UPDATE memberships SET status = 'rejected', decided_at = CURRENT_TIMESTAMP, decided_by = ? WHERE id = ?", req.user.id, m.id));
     (await logAct(req.user, 'reject', 'membership', m.id, `${m.email} request declined`));
+    const t = await get('SELECT name FROM tenants WHERE id = ?', req.user.tid);
+    await notify([m.user_id], { title: 'Request declined', body: `${t.name} didn't approve your request to join.`, url: '/', tag: 'membership' });
     return { ok: true };
   }));
 

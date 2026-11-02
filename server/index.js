@@ -11,6 +11,7 @@ import { logAct } from './activity.js';
 import { ensureDefaults, ensureRolePerms, init as initFeatures, registerGst } from './features.js';
 import { registerOrgs } from './orgs.js';
 import { registerVoice } from './voice.js';
+import { registerPush, dailyDigest } from './push.js';
 import { registerTasks, ensureTaskPerms } from './tasks.js';
 import { tenantModules, permsForModules } from './modules.js';
 
@@ -132,7 +133,7 @@ let runRecurring = null; // set once features are registered (below)
 app.get('/api/cron/recurring', async (req, res) => {
   const secret = process.env.CRON_SECRET;
   if (!secret || req.headers.authorization !== `Bearer ${secret}`) return res.status(401).json({ error: 'Not allowed' });
-  try { await runRecurring(); res.json({ ok: true }); }
+  try { await runRecurring(); const digest = await dailyDigest(); res.json({ ok: true, digest }); }
   catch (e) { console.error('recurring cron failed', e.message); res.status(500).json({ error: 'Recurring run failed' }); }
 });
 
@@ -167,6 +168,7 @@ base.put('/account', wrap(async (req) => {
   return { ok: true, user: { name: o.name || u.name, email: o.email || u.email } };
 }));
 registerOrgs({ app, base, wrap, fail, hashPassword, checkPassword, newSession, hasPerm });
+registerPush({ base, wrap, fail });
 app.use('/api', base);
 const api = express.Router();
 api.use(member);
@@ -745,6 +747,12 @@ app.use(express.static(path.join(__dirname, '..', 'public'), { setHeaders: (res)
 (await ensureTaskPerms());
 const { reminderQueue, runDue } = initFeatures({ api, need, wrap, fail, crud, saveInvoice, invoiceDetail, refreshPaid });
 runRecurring = runDue;
+// daily push summary (money due + own tasks), once a day after 9 am India time; on Vercel the cron route sends it
+if (!process.env.VERCEL) {
+  const digestIfTime = () => { if (new Date(Date.now() + 5.5 * 3600e3).getUTCHours() >= 9) dailyDigest().catch((e) => console.error('daily digest failed', e.message)); };
+  setTimeout(digestIfTime, 15000);
+  setInterval(digestIfTime, 60 * 60 * 1000).unref();
+}
 registerGst({ api, need, wrap });
 registerTasks({ api, need, wrap, fail });
 export const voice = registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState, saveInvoice }); // exported for tests (voice._test)

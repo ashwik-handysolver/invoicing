@@ -1,9 +1,16 @@
 import { all, get, run, tx, getSetting, setSetting } from './db.js';
 import { logAct } from './activity.js';
+import { notify } from './push.js';
 
 /* ------------------------------------------------ task management */
 export const TASK_PRIORITIES = ['high', 'medium', 'low'];
-export const TASK_STATUSES = ['todo', 'in_progress', 'done'];
+export const TASK_STATUSES = ['assigned', 'in_progress', 'overdue', 'completed', 'paused'];
+// still being worked on: these become "overdue" once the due date has passed (completed / paused tasks don't)
+export const OPEN_STATUSES = ['assigned', 'in_progress', 'overdue'];
+const istToday = () => new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);
+// Move open tasks past their due date to "overdue" (one organisation, or all with no tid)
+export const markOverdue = (tid) => run(`UPDATE tasks SET status = 'overdue' WHERE status IN ('assigned', 'in_progress')
+  AND due_date IS NOT NULL AND due_date < ?${tid ? ' AND tenant_id = ?' : ''}`, istToday(), ...(tid ? [tid] : []));
 export const TASK_PERMS = ['tasks.view', 'tasks.create', 'tasks.edit', 'tasks.delete'];
 
 // tables: tasks, task_assignees (supabase/schema.sql)
@@ -11,6 +18,13 @@ export const TASK_PERMS = ['tasks.view', 'tasks.create', 'tasks.edit', 'tasks.de
 if (!(await getSetting('tasks_multi_assignees', false))) {
   (await run('INSERT OR IGNORE INTO task_assignees (task_id, user_id) SELECT id, assigned_to FROM tasks WHERE assigned_to IS NOT NULL'));
   (await setSetting('tasks_multi_assignees', true));
+}
+
+// one-time: old statuses (todo / done) -> assigned / completed
+if (!(await getSetting('task_statuses_v2', false))) {
+  (await run("UPDATE tasks SET status = 'assigned' WHERE status = 'todo'"));
+  (await run("UPDATE tasks SET status = 'completed' WHERE status = 'done'"));
+  (await setSetting('task_statuses_v2', true));
 }
 
 // Team members of existing organisations get the task permissions once (Admin already has '*').
@@ -39,9 +53,17 @@ export async function withAssignees(rows) {
   for (const r of list) { r.assignees = by[r.id] || []; delete r.assigned_to; }
   return rows;
 }
-export const setAssignees = async (taskId, ids) => {
+// Replace a task's assignees; people newly added (other than `actor`, who did it) get a push notification.
+export const setAssignees = async (taskId, ids, actor) => {
+  const before = new Set((await all('SELECT user_id FROM task_assignees WHERE task_id = ?', taskId)).map((r) => r.user_id));
   (await run('DELETE FROM task_assignees WHERE task_id = ?', taskId));
   for (const id of ids) (await run('INSERT OR IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)', taskId, id));
+  const added = [...new Set(ids.map(Number))].filter((id) => !before.has(id) && id !== actor?.id);
+  if (added.length) {
+    const t = await get('SELECT title, due_date FROM tasks WHERE id = ?', taskId);
+    await notify(added, { title: 'New task for you', url: '/#/tasks', tag: `task-${taskId}`,
+      body: `${t.title}${t.due_date ? ` · due ${t.due_date.split('-').reverse().join('-')}` : ''}${actor?.name ? ` · from ${actor.name}` : ''}` });
+  }
 };
 
 // People a user may assign tasks to: approved, active members; team members cannot assign to admins.
@@ -71,8 +93,8 @@ export function registerTasks({ api, need, wrap, fail }) {
 
   // people tasks can be assigned to
   api.get('/tasks/people', need('tasks.view'), wrap(async (req) => (await assignablePeople(req.user))));
-  api.get('/tasks', need('tasks.view'), wrap(async (req) => { const v = taskScope(req.user); return (await withAssignees((await all(`${row} WHERE t.tenant_id = ? AND ${v.sql}
-    ORDER BY CASE t.status WHEN 'done' THEN 1 ELSE 0 END, t.due_date IS NULL, t.due_date, CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, t.id DESC`, req.user.tid, ...v.params)))); }));
+  api.get('/tasks', need('tasks.view'), wrap(async (req) => { await markOverdue(req.user.tid); const v = taskScope(req.user); return (await withAssignees((await all(`${row} WHERE t.tenant_id = ? AND ${v.sql}
+    ORDER BY CASE t.status WHEN 'completed' THEN 2 WHEN 'paused' THEN 1 ELSE 0 END, t.due_date IS NULL, t.due_date, CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, t.id DESC`, req.user.tid, ...v.params)))); }));
   api.post('/tasks', need('tasks.create'), wrap(async (req) => {
     const { o, assignees } = (await pick(req));
     if (!o.title) throw fail(400, 'Title is required');
@@ -80,10 +102,11 @@ export function registerTasks({ api, need, wrap, fail }) {
     const keys = Object.keys(o);
     const id = (await tx(async () => {
       const tid = (await run(`INSERT INTO tasks (tenant_id, ${keys.join(',')}) VALUES (?, ${keys.map(() => '?').join(',')})`, req.user.tid, ...keys.map((k) => o[k]))).lastInsertRowid;
-      (await setAssignees(tid, assignees || []));
+      (await setAssignees(tid, assignees || [], req.user));
       return tid;
     }));
     (await logAct(req.user, 'create', 'tasks', id, o.title));
+    await markOverdue(req.user.tid); // created with a past due date
     req.params.id = id;
     return (await withAssignees((await one(req))));
   }));
@@ -96,12 +119,15 @@ export function registerTasks({ api, need, wrap, fail }) {
       if (Object.keys(o).some((k) => k !== 'status') || assignees !== undefined) throw fail(403, 'You can only update the status of a task assigned to you');
     }
     if ('title' in o && !o.title) throw fail(400, 'Title is required');
+    // due date moved to today or later: an overdue task is back to "assigned" (unless a status was chosen too)
+    if (o.due_date !== undefined && !('status' in o) && old.status === 'overdue' && (!o.due_date || o.due_date >= istToday())) o.status = 'assigned';
     const keys = Object.keys(o);
     (await tx(async () => {
       if (keys.length) (await run(`UPDATE tasks SET ${keys.map((k) => `${k} = ?`).join(',')} WHERE id = ? AND tenant_id = ?`, ...keys.map((k) => o[k]), old.id, req.user.tid));
-      if (assignees !== undefined) (await setAssignees(old.id, assignees));
+      if (assignees !== undefined) (await setAssignees(old.id, assignees, req.user));
     }));
     (await logAct(req.user, 'update', 'tasks', old.id, o.title || old.title));
+    await markOverdue(req.user.tid);
     return (await withAssignees((await one(req))));
   }));
   api.delete('/tasks/:id', need('tasks.delete'), wrap(async (req) => {

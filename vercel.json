@@ -11,6 +11,6 @@
     { "source": "/p/(.*)", "destination": "/index.html" }
   ],
   "crons": [
-    { "path": "/api/cron/recurring", "schedule": "0 1 * * *" }
+    { "path": "/api/cron/recurring", "schedule": "30 3 * * *" }
   ]
 }

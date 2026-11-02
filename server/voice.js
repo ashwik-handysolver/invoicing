@@ -9,7 +9,7 @@ import { r2, calcInvoice } from './calc.js';
 import { MODULES, ALL_MODULES, tenantModules } from './modules.js';
 import { deleteTenant } from './orgs.js';
 import { logAct } from './activity.js';
-import { TASK_PRIORITIES, TASK_STATUSES, taskScope, assignable, assignablePeople, assignedToSql, isAssignee, withAssignees, setAssignees } from './tasks.js';
+import { TASK_PRIORITIES, TASK_STATUSES, OPEN_STATUSES, markOverdue, taskScope, assignable, assignablePeople, assignedToSql, isAssignee, withAssignees, setAssignees } from './tasks.js';
 
 // Provider: VOICE_PROVIDER=claude|gemini, or picked from whichever key is set (Claude first).
 const GEMINI_KEY = () => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -55,7 +55,7 @@ const TOOLS = [
     input_schema: obj({ invoice_id: { type: 'integer' }, amount: { type: 'number' }, mode: { type: 'string', enum: ['UPI', 'Bank Transfer', 'Cash', 'Cheque', 'Card', 'Other'] },
       paid_on: { type: 'string', description: 'YYYY-MM-DD, default today' }, reference: { type: 'string' } }, ['invoice_id']) },
   { name: 'find_tasks', description: 'Search tasks by title / description text, assignee name, status or priority. "mine" = assigned to the user. Use before update_task to get the task_id. Empty input lists open tasks.',
-    input_schema: obj({ query: { type: 'string' }, assignee: { type: 'string', description: 'person name, or "me"' }, status: { type: 'string', enum: [...TASK_STATUSES, 'open', 'overdue', 'any'] }, priority: { type: 'string', enum: TASK_PRIORITIES } }) },
+    input_schema: obj({ query: { type: 'string' }, assignee: { type: 'string', description: 'person name, or "me"' }, status: { type: 'string', enum: [...TASK_STATUSES, 'open', 'any'] }, priority: { type: 'string', enum: TASK_PRIORITIES } }) },
   { name: 'find_people', description: 'List the team members tasks can be assigned to (id and name).', input_schema: obj({ query: { type: 'string' } }) },
   { name: 'create_task', description: 'Create a task and optionally assign it to one or more team members (assignees = user ids from find_people). The user becomes the assigner. The user confirms before it is saved.',
     input_schema: obj({ title: { type: 'string' }, description: { type: 'string' }, due_date: { type: 'string', description: 'YYYY-MM-DD' }, priority: { type: 'string', enum: TASK_PRIORITIES },
@@ -82,7 +82,7 @@ const TOOLS = [
 ]; // inputs are validated in plan()/read() before anything runs
 const WRITE = new Set(['update_client', 'create_client', 'record_payment', 'create_task', 'update_task', 'create_invoice', 'update_invoice', 'delete_invoice', 'delete_client',
   'set_organisation_status', 'set_organisation_modules', 'delete_organisation']);
-const ST_LABEL = { todo: 'to do', in_progress: 'in progress', done: 'done' };
+const ST_LABEL = { assigned: 'assigned', in_progress: 'in progress', overdue: 'overdue', completed: 'completed', paused: 'paused' };
 
 const SYSTEM = `You are the voice assistant inside an Indian GST invoicing app. The user speaks Hindi, English or a mix (Hinglish); speech-to-text may mis-spell names, so search loosely and pick the closest match.
 Rules:
@@ -92,7 +92,7 @@ Rules:
 - If several records match and you cannot tell which one, ask a short question listing them instead of guessing.
 - To email or WhatsApp an invoice or reminder, use compose_message: the app opens a filled-in draft and the user sends it. Never say you cannot send email.
 - If the client has no email (or mobile for WhatsApp) saved, do not send the user to another page: ask for it in one short question. When they give it, call update_client with that email/mobile and then_compose, so it is saved and the draft opens as soon as they confirm.
-- Tasks: statuses are todo, in_progress, done; priorities high, medium, low. Turn relative dates ("kal", "next Friday") into YYYY-MM-DD using today's date. To assign, look the person up with find_people.
+- Tasks: statuses are assigned, in_progress, overdue, completed, paused (open tasks past their due date become overdue automatically); priorities high, medium, low. Turn relative dates ("kal", "next Friday") into YYYY-MM-DD using today's date. To assign, look the person up with find_people.
 - Invoices: find the client (and products for the lines) first, then create_invoice. To edit, get_invoice first and pass the full new item list if lines change.
 - Organisation tools (find_organisations, set_organisation_status, set_organisation_modules, delete_organisation) are for platform management only; they never expose an organisation's business data.
 - If no tool can do what was asked, say so briefly.
@@ -161,8 +161,8 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
       if (query) { w.push('(t.title LIKE ? OR t.description LIKE ?)'); p.push(`%${query}%`, `%${query}%`); }
       if (assignee && /^(me|mine|my|mera|mujhe)$/i.test(assignee.trim())) { w.push(assignedToSql()); p.push(u.id); }
       else if (assignee) { w.push('EXISTS (SELECT 1 FROM task_assignees a JOIN users au ON au.id = a.user_id WHERE a.task_id = t.id AND au.name LIKE ?)'); p.push(`%${assignee}%`); }
-      if (status === 'overdue') { w.push("t.status != 'done' AND t.due_date < ?"); p.push(today()); }
-      else if (!status || status === 'open') w.push("t.status != 'done'");
+      await markOverdue(u.tid);
+      if (!status || status === 'open') w.push(`t.status IN (${OPEN_STATUSES.map((s) => `'${s}'`).join(',')})`);
       else if (status !== 'any') { w.push('t.status = ?'); p.push(status); }
       if (priority) { w.push('t.priority = ?'); p.push(priority); }
       return (await withAssignees((await all(`SELECT t.id, t.title, t.description, t.due_date, t.priority, t.status, ub.name AS assigned_by,
@@ -185,7 +185,7 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
     for (const k of ['title', 'description']) if (f[k] != null && String(f[k]).trim()) o[k] = String(f[k]).trim();
     if (f.due_date != null) { if (!/^\d{4}-\d{2}-\d{2}$/.test(f.due_date)) throw fail(400, 'Due date must be YYYY-MM-DD'); o.due_date = f.due_date; }
     if (f.priority != null) { if (!TASK_PRIORITIES.includes(f.priority)) throw fail(400, 'Priority must be high, medium or low'); o.priority = f.priority; }
-    if (f.status != null) { if (!TASK_STATUSES.includes(f.status)) throw fail(400, 'Status must be todo, in_progress or done'); o.status = f.status; }
+    if (f.status != null) { if (!TASK_STATUSES.includes(f.status)) throw fail(400, 'Status must be assigned, in_progress, overdue, completed or paused'); o.status = f.status; }
     let list = Array.isArray(f.assignees) ? f.assignees.map(Number) : null;
     if (f.add_assignees?.length || f.remove_assignees?.length) list = [...(list || current), ...(f.add_assignees || []).map(Number)].filter((id) => !(f.remove_assignees || []).map(Number).includes(id));
     if (list) o.assignees = await Promise.all([...new Set(list)].map(async (id) => (await personOf(u, id)).id));
@@ -236,7 +236,7 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
   Object.assign(plan, {
     async create_task(u, f) {
       need(u, 'tasks.create');
-      const o = { priority: 'medium', status: 'todo', ...(await taskFields(u, f)) };
+      const o = { priority: 'medium', status: 'assigned', ...(await taskFields(u, f)) };
       if (!o.title) throw fail(400, 'Task title is required');
       return { input: o, summary: `Create task ${(await describe(u, o))}` };
     },
@@ -257,7 +257,7 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
       for (const id of assignees) await personOf(u, id);
       const keys = Object.keys(f);
       const id = (await run(`INSERT INTO tasks (tenant_id, assigned_by, ${keys.join(',')}) VALUES (?, ?, ${keys.map(() => '?').join(',')})`, u.tid, u.id, ...keys.map((k) => f[k]))).lastInsertRowid;
-      (await setAssignees(id, assignees));
+      (await setAssignees(id, assignees, u));
       (await logAct(u, 'create', 'tasks', id, `${o.title} (voice)`));
       return { refresh: true, open: '#/tasks' };
     },
@@ -267,7 +267,7 @@ export function registerVoice({ api, wrap, fail, hasPerm, refreshPaid, withState
       (await taskWrite(u, t, o));
       const { assignees, ...f } = o, keys = Object.keys(f);
       if (keys.length) (await run(`UPDATE tasks SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ? AND tenant_id = ?`, ...keys.map((k) => f[k]), t.id, u.tid));
-      if (assignees) { for (const id of assignees) await personOf(u, id); (await setAssignees(t.id, assignees)); }
+      if (assignees) { for (const id of assignees) await personOf(u, id); (await setAssignees(t.id, assignees, u)); }
       (await logAct(u, 'update', 'tasks', t.id, `${o.title || t.title} (voice)`));
       return { refresh: true, open: '#/tasks' };
     },
