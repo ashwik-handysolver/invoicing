@@ -50,7 +50,7 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
   const tenantByCode = async (code) => {
     const c = normCode(code);
     if (!c) throw fail(400, 'Organisation codes look like ABCDE-23456');
-    const t = (await get('SELECT id, name FROM tenants WHERE invite_code = ?', c));
+    const t = (await get('SELECT id, name, modules FROM tenants WHERE invite_code = ?', c));
     if (!t) throw fail(404, "That code doesn't match any organisation. Check it with your admin and try again.");
     return t;
   };
@@ -68,7 +68,7 @@ export function registerOrgs({ app, base, wrap, fail, hashPassword, checkPasswor
     }
     const id = (await run("INSERT INTO memberships (tenant_id, user_id, role, status) VALUES (?, ?, 'member', 'pending')", t.id, user.id)).lastInsertRowid;
     (await logAct(null, 'request', 'membership', id, `${user.email} asked to join`, t.id));
-    await notify(await tenantAdmins(t.id), { title: 'New join request', body: `${user.name || user.email} wants to join ${t.name}`, url: '/#/dashboard', tag: `join-${id}` });
+    await notify(await tenantAdmins(t.id), { title: 'New join request', body: `${user.name || user.email} wants to join ${t.name}`, url: tenantModules(t.modules).includes('invoicing') ? '/#/dashboard' : '/#/tasks/dashboard', tag: `join-${id}` });
     return 'pending';
   }
 

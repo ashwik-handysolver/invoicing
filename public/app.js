@@ -1628,6 +1628,7 @@ async function viewTaskDashboard(el) {
 
   el.innerHTML = `<div class="pagehead dash-head"><div><div class="eyebrow">${greet}, ${esc((S.user.name || '').split(' ')[0])}</div><h1 class="keep">${team ? 'Team tasks at a glance' : 'Your tasks at a glance'}</h1></div>
       <div class="row"><a class="btn" href="#/tasks">${ic('check')} All tasks</a>${can('tasks.create') ? `<button class="btn primary" id="tadd">${ic('plus')} Add task</button>` : ''}</div></div>
+    ${S.user.isAdmin ? '<div id="adm"></div>' : ''}
     ${!list.length ? `<div class="empty card">${ic('check', 28)}<p>No tasks yet. Add one to see your dashboard come alive.</p></div>` : `
     <div class="dg">
       <section class="hero c7"><div class="hero-l"><div class="hero-k">Open tasks</div><div class="hero-v">${open.length}</div>
@@ -1656,6 +1657,7 @@ async function viewTaskDashboard(el) {
   $$('[data-go-tab]', el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); goTasks({ tab: a.dataset.goTab }); }));
   $$('.tk-row', el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); goTasks({ q: a.dataset.q }); }));
   if ($('#tadd', el)) $('#tadd', el).onclick = () => crudForm(CFG.tasks, null, () => viewTaskDashboard(el));
+  if ($('#adm', el)) adminPanel($('#adm', el), { setup: false, hideEmpty: true });
 }
 
 /* ------------------------------------------------------------ settings */
@@ -1679,12 +1681,19 @@ async function viewSettings(el, tab) {
   el.innerHTML = `<div class="pagehead"><h1>Settings</h1></div>
     <div class="settabs">${tabs.map((t) => `<a class="${t.id === cur.id ? 'on' : ''}" href="${t.h}">${t.l}</a>`).join('')}</div><div id="stab"></div>`;
   const body = $('#stab', el);
-  if (cur.id === 'users') return crudView(body, CFG.users);
+  if (cur.id === 'users') {
+    if (!S.user.isAdmin) return crudView(body, CFG.users);
+    body.innerHTML = '<div id="ureq" style="margin-top:22px"></div><div id="ulist"></div>';
+    adminPanel($('#ureq', body), { setup: false });
+    return crudView($('#ulist', body), CFG.users);
+  }
   if (cur.id === 'templates') return crudView(body, CFG.templates);
   if (cur.id === 'activity') return viewActivity(body);
   body.innerHTML = `${S.user.isAdmin ? '<div id="s0" style="margin-top:22px"></div>' : ''}<div id="s1" style="margin-top:22px"></div><div id="s2" style="margin-top:22px"></div>`;
-  if (S.user.isAdmin) await inviteCard($('#s0'));
-  if (can('settings.view')) { await orgDetailsCard($('#s1')); await crudView($('#s2'), CFG.ccEmails); }
+  // grab the slots before awaiting: if the user switches tab meanwhile, these cards fill detached boxes instead of crashing
+  const [s0, s1, s2] = ['#s0', '#s1', '#s2'].map((s) => $(s, body));
+  if (s0) await inviteCard(s0);
+  if (can('settings.view')) { await orgDetailsCard(s1); await crudView(s2, CFG.ccEmails); }
 }
 
 /* ------------------------------------------------------------ public client page (/p/<token>) */
@@ -2318,12 +2327,15 @@ function renderMembership() {
   $('#so2').onclick = (e) => { e.preventDefault(); clearTimeout(pollTimer); api('/logout', { method: 'POST' }).catch(() => {}); signOut(); };
 }
 
-// Dashboard: pending membership requests + unfinished setup (admins only)
-async function adminPanel(box) {
+// Pending membership requests + unfinished setup (admins only). Shown on the dashboards and Settings → Users.
+// setup: also nudge for missing organisation / bank details (invoicing only); hideEmpty: draw nothing when nobody is waiting.
+async function adminPanel(box, { setup = true, hideEmpty = false } = {}) {
+  const again = () => adminPanel(box, { setup, hideEmpty });
   const [reqs, t, roles] = await Promise.all([api('/members/requests'), api('/organisation'), api('/roles')]).catch((e) => { box.innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return []; });
   if (!t) return;
   const opts = roles.map((r) => `<option value="${r.id}" ${r.name === 'Team member' ? 'selected' : ''}>${esc(r.name)}</option>`).join('');
-  const todo = [!t.setup.details && `<button class="btn sm" data-fix="org">${ic('edit', 15)} Add organisation details</button>`, !t.setup.bank && `<button class="btn sm" data-fix="bank">${ic('wallet', 15)} Add bank details</button>`].filter(Boolean);
+  if (hideEmpty && !reqs.length) { box.innerHTML = ''; return; }
+  const todo = !setup || !can('invoices.view') ? [] : [!t.setup.details &&`<button class="btn sm" data-fix="org">${ic('edit', 15)} Add organisation details</button>`, !t.setup.bank && `<button class="btn sm" data-fix="bank">${ic('wallet', 15)} Add bank details</button>`].filter(Boolean);
   box.innerHTML = `${todo.length ? `<section class="card ob-setup"><div><h2>Finish setting up</h2><p class="small muted">These were skipped during signup. They appear on your invoices.</p></div><div class="row">${todo.join('')}</div></section>` : ''}
     <section class="card req-card"><div class="row sp"><h2>Pending requests${reqs.length ? ` <span class="badge">${reqs.length}</span>` : ''}</h2>
       <button class="btn sm" data-showcode>${ic('link', 15)} Invite code</button></div>
@@ -2337,14 +2349,14 @@ async function adminPanel(box) {
     try {
       await api(`/members/requests/${row.dataset.r}/${kind}`, { method: 'POST', body: kind === 'approve' ? { role_id: +$('select', row).value } : {} });
       toast(kind === 'approve' ? `${name} can now access the organisation` : 'Request rejected');
-    } finally { adminPanel(box); }
+    } finally { again(); }
   });
   $$('[data-ok]', box).forEach((b) => (b.onclick = act(b, 'approve')));
   $$('[data-rej]', box).forEach((b) => (b.onclick = act(b, 'reject')));
   $('[data-showcode]', box).onclick = () => { const m = modal(`<h2>Invite code</h2><p class="muted">People can use this code to request to join ${esc(t.name)}.</p>${codeBox(t.invite_code)}<div class="actions"><button class="btn" data-x>Close</button></div>`); $('[data-copy]', m.el).onclick = (e) => copyText(t.invite_code, e.currentTarget); $('[data-x]', m.el).onclick = m.close; };
   const fix = $('[data-fix=org]', box), fixB = $('[data-fix=bank]', box), org = primaryOrg();
-  if (fix) fix.onclick = () => crudForm(CFG.organisations, org, () => adminPanel(box));
-  if (fixB) fixB.onclick = () => bankModal(org, () => adminPanel(box));
+  if (fix) fix.onclick = () => crudForm(CFG.organisations, org, again);
+  if (fixB) fixB.onclick = () => bankModal(org, again);
 }
 async function bankModal(org, done) {
   const saved = await api(`/organisations/${org.id}/bank`);
